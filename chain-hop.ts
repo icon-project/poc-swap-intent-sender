@@ -67,7 +67,7 @@ type HopResult = {
   txHash: string;
   intentId: string;
   inputAmount: string;
-  status: 'executed' | 'failed' | 'timeout';
+  status: 'executed' | 'failed' | 'timeout' | 'skipped';
   elapsedMs: number;
 };
 
@@ -373,8 +373,11 @@ function buildSummaryText(results: HopResult[]): string {
   }
 
   const totalMs = results.reduce((sum, r) => sum + r.elapsedMs, 0);
+  const executed = results.filter((r) => r.status === 'executed').length;
+  const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
+  const skipped = results.filter((r) => r.status === 'skipped').length;
   lines.push(`Total elapsed: ${formatMs(totalMs)}`);
-  lines.push(`Executed: ${results.filter((r) => r.status === 'executed').length}/${results.length}`);
+  lines.push(`Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`);
   lines.push(sep);
 
   return lines.join('\n');
@@ -385,6 +388,25 @@ function saveSummary(text: string): string {
   const filename = `chain-hop-summary-${ts}.txt`;
   writeFileSync(filename, text + '\n', 'utf-8');
   return filename;
+}
+
+// ----------------------------------------------------------------------------
+// AD-HOC HOP BUILDER
+// ----------------------------------------------------------------------------
+
+function buildHop(srcKey: string, dstKey: string): HopDef {
+  const src = CHAIN_DEFS[srcKey];
+  const dst = CHAIN_DEFS[dstKey];
+  const inputToken = srcKey === 'sonic' ? SONIC_USDT : NATIVE_ADDR;
+  const outputToken = dstKey === 'sonic' ? SONIC_USDT : NATIVE_ADDR;
+  return {
+    id: `${srcKey}-to-${dstKey}`,
+    label: `${srcKey === 'sonic' ? 'USDT' : src.nativeSymbol}(${src.name}) → ${dstKey === 'sonic' ? 'USDT' : dst.nativeSymbol}(${dst.name})`,
+    srcChainKey: srcKey,
+    dstChainKey: dstKey,
+    inputToken,
+    outputToken,
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -400,28 +422,44 @@ async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
     return;
   }
 
+  // Extract ordered destination sequence and starting chain
+  const destinations: string[] = effectiveHops.map((h) => h.dstChainKey);
+  let currentChain = effectiveHops[0].srcChainKey;
+
   if (disabled.size > 0) {
-    console.log(`Effective hop sequence (${effectiveHops.length} hops):`);
-    for (const hop of effectiveHops) {
-      console.log(`  ${hop.label}`);
+    console.log(`Effective destination sequence (${destinations.length} destinations):`);
+    console.log(`  Start: ${CHAIN_DEFS[currentChain].name}`);
+    for (const dst of destinations) {
+      console.log(`  → ${CHAIN_DEFS[dst].name}`);
     }
   }
 
   const results: HopResult[] = [];
 
-  for (let i = 0; i < effectiveHops.length; i++) {
-    const hop = effectiveHops[i];
+  for (let i = 0; i < destinations.length; i++) {
+    const dstKey = destinations[i];
+
+    // Build hop dynamically from wherever funds actually are
+    const hop = buildHop(currentChain, dstKey);
+    const hopNum = i + 1;
+
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`=== Hop ${i + 1}/${effectiveHops.length}: ${hop.label} ===`);
+    console.log(`=== Hop ${hopNum}/${destinations.length}: ${hop.label} ===`);
     console.log(`${'='.repeat(60)}`);
+
+    // If the hop was rewired (source differs from original), note it
+    const originalSrc = i === 0 ? effectiveHops[0].srcChainKey : effectiveHops[i - 1]?.dstChainKey ?? currentChain;
+    if (currentChain !== originalSrc) {
+      console.log(`  (rewired: funds are on ${CHAIN_DEFS[currentChain].name}, skipping failed intermediate)`);
+    }
 
     let result: HopResult;
     try {
-      result = await executeHop(sodax, hop, privateKey, i + 1);
+      result = await executeHop(sodax, hop, privateKey, hopNum);
     } catch (err: any) {
       console.error(`  Hop failed: ${err.message}`);
       result = {
-        hopIndex: i + 1,
+        hopIndex: hopNum,
         label: hop.label,
         txHash: '',
         intentId: '',
@@ -430,47 +468,57 @@ async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
         elapsedMs: 0,
       };
     }
-    results.push(result);
 
-    // Wait for funds to arrive on the destination chain before next hop
-    if (i < effectiveHops.length - 1) {
-      const dstChain = CHAIN_DEFS[hop.dstChainKey];
-      const dstRpcUrl = getRpcUrl(dstChain);
-      const walletAddress = (await new ViemWalletProvider(
-        privateKey,
-        dstChain.viemChain,
-        dstRpcUrl,
-      ).getWalletAddress()) as Address;
+    const succeeded = result.status === 'executed';
 
-      // Record balance before waiting
-      const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-      console.log(
-        `\n  ${dstChain.name} balance before: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)}`,
-      );
-      console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
+    if (succeeded) {
+      // Update current chain to destination — funds moved
+      currentChain = dstKey;
 
-      const pollInterval = 10_000;
-      const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
-      const deadline = Date.now() + pollTimeout;
+      // Wait for funds to arrive on the destination chain before next hop
+      if (i < destinations.length - 1) {
+        const dstChain = CHAIN_DEFS[dstKey];
+        const dstRpcUrl = getRpcUrl(dstChain);
+        const walletAddress = (await new ViemWalletProvider(
+          privateKey,
+          dstChain.viemChain,
+          dstRpcUrl,
+        ).getWalletAddress()) as Address;
 
-      let balanceInPlace = false;
-      while (Date.now() < deadline) {
-        await sleep(pollInterval);
-        const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-        if (balance > balanceBefore) {
-          if (balanceInPlace) process.stdout.write('\n');
-          const received = balance - balanceBefore;
-          console.log(
-            `  Received ${formatNativeBalance(received, dstChain.nativeSymbol)}, proceeding to next hop.`,
-          );
-          break;
-        }
-        overwriteLine(
-          `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
+        const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+        console.log(
+          `\n  ${dstChain.name} balance before: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)}`,
         );
-        balanceInPlace = true;
+        console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
+
+        const pollInterval = 10_000;
+        const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
+        const deadline = Date.now() + pollTimeout;
+
+        let balanceInPlace = false;
+        while (Date.now() < deadline) {
+          await sleep(pollInterval);
+          const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+          if (balance > balanceBefore) {
+            if (balanceInPlace) process.stdout.write('\n');
+            const received = balance - balanceBefore;
+            console.log(
+              `  Received ${formatNativeBalance(received, dstChain.nativeSymbol)}, proceeding to next hop.`,
+            );
+            break;
+          }
+          overwriteLine(
+            `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
+          );
+          balanceInPlace = true;
+        }
       }
+    } else {
+      // Failure — funds are still on currentChain, do NOT update it
+      console.log(`  Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`);
     }
+
+    results.push(result);
   }
 
   // Print and save summary

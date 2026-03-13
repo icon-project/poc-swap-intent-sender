@@ -32,13 +32,18 @@ export class ViemWalletProvider implements IEvmWalletProvider {
 
   constructor(privateKey: Hex, chain: Chain, rpcUrl: string) {
     const account = privateKeyToAccount(privateKey);
+    // Strip the chain's custom `fees` config so viem uses pure RPC-based fee
+    // estimation. Some chains (e.g. Polygon) ship with a `fees` override that
+    // produces a maxFeePerGas far below the actual base fee, causing every
+    // transaction to fail with FeeCapTooLowError.
+    const cleanChain = { ...chain, fees: undefined } as Chain;
     this.walletClient = createWalletClient({
       account,
-      chain,
+      chain: cleanChain,
       transport: http(rpcUrl),
     });
     this.publicClient = createPublicClient({
-      chain,
+      chain: cleanChain,
       transport: http(rpcUrl),
     });
   }
@@ -49,12 +54,43 @@ export class ViemWalletProvider implements IEvmWalletProvider {
   }
 
   async sendTransaction(tx: EvmRawTransaction): Promise<Hash> {
-    return this.walletClient.sendTransaction({
+    const params = {
       to: tx.to as Address,
       data: tx.data as Hex,
       value: tx.value ? BigInt(tx.value) : undefined,
-      type: 'eip1559',
-    });
+    };
+    try {
+      return await this.walletClient.sendTransaction(params);
+    } catch (err: any) {
+      // Some RPCs have broken EIP-1559 support during gas estimation
+      // (gasPrice conflict, FeeCapTooLow with bogus maxFeePerGas, etc.).
+      // Retry as a legacy tx with manually-fetched gasPrice and gas limit
+      // so viem doesn't need to call eth_estimateGas with fee fields.
+      const msg = String(err?.details ?? err?.cause?.details ?? '');
+      const isGasConflict = msg.includes('gasPrice') && msg.includes('maxFeePerGas');
+      const isFeeCapLow =
+        msg.includes('max fee per gas less than block base fee') ||
+        err?.cause?.name === 'FeeCapTooLowError';
+      if (isGasConflict || isFeeCapLow) {
+        const from = await this.getWalletAddress();
+        const [gasPrice, gas] = await Promise.all([
+          this.publicClient.getGasPrice(),
+          this.publicClient.estimateGas({
+            account: from,
+            to: params.to,
+            data: params.data,
+            value: params.value,
+          }),
+        ]);
+        return this.walletClient.sendTransaction({
+          ...params,
+          type: 'legacy',
+          gasPrice,
+          gas,
+        });
+      }
+      throw err;
+    }
   }
 
   async waitForTransactionReceipt(hash: Hash): Promise<EvmRawTransactionReceipt> {
@@ -130,7 +166,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     viemChain: polygon,
     name: 'Polygon',
     nativeSymbol: 'POL',
-    defaultRpcUrl: 'https://polygon.drpc.org',
+    defaultRpcUrl: 'https://polygon-bor-rpc.publicnode.com',
     rpcEnvVar: 'POLYGON_RPC_URL',
   },
   ethereum: {

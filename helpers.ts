@@ -2,10 +2,8 @@ import {
   http,
   type Address,
   type Hex,
-  type TransactionReceipt,
   createPublicClient,
   createWalletClient,
-  decodeEventLog,
   formatUnits,
   getAddress,
   isAddress,
@@ -14,7 +12,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { sonic } from 'viem/chains';
-import { IntentsAbi } from './intents.abi';
+import type { Intent } from '@sodax/sdk';
 
 // ----------------------------------------------------------------------------
 // ENV HELPERS
@@ -131,27 +129,15 @@ export const TEST_CASES: Record<TestCaseName, TestCase> = {
   },
 };
 
-export type DecodedIntent = {
-  intentHash: Hex;
-  intentId: string;
-  creator: Address;
-  inputToken: Address;
-  outputToken: Address;
-  inputAmount: string;
-  minOutputAmount: string;
-  deadline: string;
-  allowPartialFill: boolean;
-  srcChain: string;
-  dstChain: string;
-  srcAddress: Hex;
-  dstAddress: Hex;
-  solver: Address;
-  data: Hex;
-};
-
+/**
+ * Wire shape of `POST /v1/swaps/submit-tx` (swaps v2). The intent's bigint fields are
+ * serialized as decimal strings; `srcChain`/`dstChain` are relay chain ids (the SDK's
+ * `Intent` already produces these). `srcChainKey` is the source SpokeChainKey (e.g.
+ * `sonic`, `0xa4b1.arbitrum`) — renamed from v1's `srcChainId`.
+ */
 export type SubmitTxPayload = {
   txHash: Hex;
-  srcChainId: string;
+  srcChainKey: string;
   walletAddress: Address;
   intent: {
     intentId: string;
@@ -284,83 +270,46 @@ export function getMinOutputAmount(inputAmount: bigint): bigint {
 }
 
 // ----------------------------------------------------------------------------
-// INTENT DECODING
-// ----------------------------------------------------------------------------
-
-export function extractIntentFromReceipt(receipt: TransactionReceipt): DecodedIntent {
-  console.log(`  Scanning ${receipt.logs.length} logs for IntentCreated event...`);
-
-  for (const logEntry of receipt.logs) {
-    try {
-      const decoded = decodeEventLog({
-        abi: IntentsAbi,
-        data: logEntry.data,
-        topics: logEntry.topics,
-      });
-
-      if (decoded.eventName !== 'IntentCreated') continue;
-
-      const i = decoded.args.intent;
-      const result: DecodedIntent = {
-        intentHash: decoded.args.intentHash as Hex,
-        intentId: i.intentId.toString(),
-        creator: i.creator,
-        inputToken: i.inputToken,
-        outputToken: i.outputToken,
-        inputAmount: i.inputAmount.toString(),
-        minOutputAmount: i.minOutputAmount.toString(),
-        deadline: i.deadline.toString(),
-        allowPartialFill: i.allowPartialFill,
-        srcChain: i.srcChain.toString(),
-        dstChain: i.dstChain.toString(),
-        srcAddress: i.srcAddress as Hex,
-        dstAddress: i.dstAddress as Hex,
-        solver: i.solver,
-        data: i.data as Hex,
-      };
-
-      console.log(`  IntentCreated decoded`);
-      console.log(`  Intent hash : ${result.intentHash}`);
-      console.log(`  Intent ID   : ${result.intentId}`);
-      return result;
-    } catch {
-      // Not an IntentsAbi event — skip
-    }
-  }
-
-  throw new Error('IntentCreated event not found in receipt');
-}
-
-// ----------------------------------------------------------------------------
 // BACKEND INTERACTION
 // ----------------------------------------------------------------------------
 
+/**
+ * Build the `POST /v1/swaps/submit-tx` payload from the SDK's `createIntent` result.
+ * The SDK `Intent` already carries relay chain ids in `srcChain`/`dstChain` and bigints
+ * for the numeric fields, so we just serialize bigints to decimal strings here.
+ *
+ * `relayData` is the SDK's `RelayExtraData.payload` (a Hex). It is only consumed by the
+ * relay for Solana sources; EVM/Sonic flows relay `{ chain_id, tx_hash }` and ignore it,
+ * but the endpoint validates it as a non-empty hex string, so we always pass the payload.
+ */
 export function buildSubmitPayload(
   txHash: Hex,
   walletAddress: Address,
-  decodedIntent: DecodedIntent,
+  srcChainKey: string,
+  intent: Intent,
+  relayData: Hex,
 ): SubmitTxPayload {
   return {
     txHash,
-    srcChainId: 'sonic',
+    srcChainKey,
     walletAddress,
     intent: {
-      intentId: decodedIntent.intentId,
-      creator: decodedIntent.creator,
-      inputToken: decodedIntent.inputToken,
-      outputToken: decodedIntent.outputToken,
-      inputAmount: decodedIntent.inputAmount,
-      minOutputAmount: decodedIntent.minOutputAmount,
-      deadline: decodedIntent.deadline,
-      allowPartialFill: decodedIntent.allowPartialFill,
-      srcChain: decodedIntent.srcChain,
-      dstChain: decodedIntent.dstChain,
-      srcAddress: decodedIntent.srcAddress,
-      dstAddress: decodedIntent.dstAddress,
-      solver: decodedIntent.solver,
-      data: decodedIntent.data,
+      intentId: intent.intentId.toString(),
+      creator: intent.creator,
+      inputToken: intent.inputToken,
+      outputToken: intent.outputToken,
+      inputAmount: intent.inputAmount.toString(),
+      minOutputAmount: intent.minOutputAmount.toString(),
+      deadline: intent.deadline.toString(),
+      allowPartialFill: intent.allowPartialFill,
+      srcChain: intent.srcChain.toString(),
+      dstChain: intent.dstChain.toString(),
+      srcAddress: intent.srcAddress,
+      dstAddress: intent.dstAddress,
+      solver: intent.solver,
+      data: intent.data,
     },
-    relayData: '0x',
+    relayData,
   };
 }
 
@@ -384,14 +333,22 @@ export async function submitIntent(payload: SubmitTxPayload, backendBaseUrl: str
   return body;
 }
 
+/**
+ * PRIMARY status poll — the swaps-api v2 `GET /submit-tx/status` route. This is the endpoint
+ * under test: keyed exactly by `(txHash, srcChainKey)`, it reports the swaps-api pipeline's
+ * own view (`pending → relaying → relayed → posting_execution → executed | failed`) and, on
+ * failure, *why* (`failedAtStep` / `failureReason` / `userMessage`), plus the on-chain
+ * `intentCancelled` flag. The intent journal (see `crossCheckIntentJournal`) can't surface
+ * pipeline-step failures — notably a relay failure means nothing ever lands in the journal.
+ */
 export async function pollIntentStatus(
   txHash: string,
   backendBaseUrl: string,
   intervalMs = 3000,
   timeoutMs = 120000,
-  srcChainId = 'sonic',
+  srcChainKey = 'sonic',
 ) {
-  const url = `${backendBaseUrl}/submit-tx/status?txHash=${txHash}&srcChainId=${srcChainId}`;
+  const url = `${backendBaseUrl}/submit-tx/status?txHash=${txHash}&srcChainKey=${srcChainKey}`;
   console.log(`  GET ${url}`);
   console.log(`  Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`);
 
@@ -399,7 +356,6 @@ export async function pollIntentStatus(
   const deadline = Date.now() + timeoutMs;
   let lastStatus = '';
   let pollCount = 0;
-
   const pollStart = Date.now();
   let inPlace = false;
 
@@ -442,9 +398,14 @@ export async function pollIntentStatus(
         console.log(`  Swap failed`);
         console.log(`  failedAtStep: ${body.data.failedAtStep ?? ''}`);
         console.log(`  failureReason: ${body.data.failureReason ?? ''}`);
+        // v2 status enrichment (swaps-api): user-facing hint + on-chain cancel flag + abandonment.
+        if (body.data.userMessage) console.log(`  userMessage: ${body.data.userMessage}`);
+        if (body.data.intentCancelled !== undefined)
+          console.log(`  intentCancelled: ${body.data.intentCancelled}`);
+        if (body.data.abandonedAt) console.log(`  abandonedAt: ${body.data.abandonedAt}`);
       }
 
-      console.log(`\n  Full response:`);
+      console.log(`\n  Full submit-tx/status response:`);
       console.dir(body, { depth: null });
       return body;
     }
@@ -453,4 +414,216 @@ export async function pollIntentStatus(
   }
 
   throw new Error(`Polling timed out after ${timeoutMs}ms — last status: ${lastStatus}`);
+}
+
+/** Subset of the apps/api intent-journal response we read while polling. */
+type IntentJournalResponse = {
+  intentHash: string;
+  txHash: string;
+  open: boolean;
+  events?: Array<{ eventType: string; txHash: string; blockNumber?: number }>;
+  packetData?: { status: string; dst_tx_hash: string };
+};
+
+/**
+ * How to look the intent up in the journal:
+ *  - `{ txHash }`     → `GET /intent/tx/:txHash` — instance-precise, but only matches
+ *    when the broadcast tx IS the hub (Sonic) intent tx (i.e. Sonic-source swaps).
+ *  - `{ intentHash }` → `GET /intent/:intentHash` — use for cross-chain swaps where the
+ *    broadcast tx is on a spoke chain (the journal is keyed by the hub tx). `findOne`
+ *    by hash, so it returns the latest instance — fine for a single fresh swap.
+ */
+export type IntentJournalLookup = { txHash: string } | { intentHash: string };
+
+/**
+ * Poll the intent journal via apps/api as an *independent on-chain confirmation* of the swap
+ * (complements `pollIntentStatus`, which is the swaps-api's own self-report). The journal is
+ * written by the aggregator/transformator from on-chain INTENT_* events and is identical
+ * across deployments, so it is ground truth for "did the fill/cancel actually land on-chain".
+ *
+ * Lifecycle: 404 until the aggregator observes `INTENT_CREATED` → `open: true` (created,
+ * awaiting fill/cancel) → `open: false` once a terminal `intent-filled` / `intent-cancelled`
+ * event lands. `packetData` carries the cross-chain delivery proof when present.
+ */
+export async function pollIntentJournal(
+  apiBaseUrl: string,
+  lookup: IntentJournalLookup,
+  intervalMs = 3000,
+  timeoutMs = 180000,
+) {
+  const path = 'txHash' in lookup ? `intent/tx/${lookup.txHash}` : `intent/${lookup.intentHash}`;
+  const url = `${apiBaseUrl}/${path}`;
+  console.log(`  GET ${url}`);
+  console.log(`  Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`);
+
+  const deadline = Date.now() + timeoutMs;
+  let pollCount = 0;
+  let lastState = '';
+  let inPlace = false;
+  const pollStart = Date.now();
+
+  while (Date.now() < deadline) {
+    pollCount++;
+    const elapsed = formatElapsed(pollStart);
+    const response = await fetch(url);
+
+    // 404 until the aggregator observes INTENT_CREATED on-chain and the transformator
+    // writes the journal row — expected for the first few polls after submission.
+    if (response.status === 404) {
+      overwriteLine(`  Poll #${pollCount} — not in journal yet (404), waiting... (${elapsed})`);
+      inPlace = true;
+      await sleep(intervalMs);
+      continue;
+    }
+
+    if (!response.ok) {
+      overwriteLine(`  Poll #${pollCount} — HTTP ${response.status}, retrying... (${elapsed})`);
+      inPlace = true;
+      await sleep(intervalMs);
+      continue;
+    }
+
+    const journal = (await response.json()) as IntentJournalResponse;
+    const state = journal.open ? 'open' : 'closed';
+
+    if (state !== lastState) {
+      if (inPlace) process.stdout.write('\n');
+      inPlace = false;
+      console.log(
+        `  Poll #${pollCount} — journal: ${lastState ? `${lastState} -> ` : ''}${state} (${elapsed})`,
+      );
+      lastState = state;
+    } else {
+      overwriteLine(`  Poll #${pollCount} — journal: ${state} (${elapsed})`);
+      inPlace = true;
+    }
+
+    // `open: false` means a terminal INTENT_FILLED / INTENT_CANCELLED has been observed.
+    if (!journal.open) {
+      if (inPlace) process.stdout.write('\n');
+      const events = journal.events ?? [];
+      const filled = events.find((e) => e.eventType === 'intent-filled');
+      const cancelled = events.find((e) => e.eventType === 'intent-cancelled');
+      if (filled) {
+        console.log(`  Intent FILLED`);
+        console.log(`  fill txHash : ${filled.txHash}`);
+      } else if (cancelled) {
+        console.log(`  Intent CANCELLED`);
+        console.log(`  cancel txHash: ${cancelled.txHash}`);
+      } else {
+        console.log(`  Intent closed (no fill/cancel event present)`);
+      }
+      if (journal.packetData) {
+        console.log(`  packet status: ${journal.packetData.status}`);
+        console.log(`  dst tx hash  : ${journal.packetData.dst_tx_hash}`);
+      }
+      console.log(`\n  Journal entry:`);
+      console.dir(journal, { depth: null });
+      return journal;
+    }
+
+    await sleep(intervalMs);
+  }
+
+  throw new Error(
+    `Polling timed out after ${timeoutMs}ms — last journal state: ${lastState || 'not found'}`,
+  );
+}
+
+/**
+ * Soft, bounded journal confirmation run AFTER the primary `pollIntentStatus` has reached a
+ * terminal state. The aggregator may lag the swaps-api by a few blocks, so this never fails
+ * the run: a timeout (journal not yet caught up) is logged as inconclusive, not thrown.
+ */
+export async function crossCheckIntentJournal(
+  apiBaseUrl: string,
+  lookup: IntentJournalLookup,
+  intervalMs = 3000,
+  timeoutMs = 90000,
+): Promise<void> {
+  console.log(`  Independent on-chain confirmation via the intent journal:`);
+  try {
+    await pollIntentJournal(apiBaseUrl, lookup, intervalMs, timeoutMs);
+  } catch (err) {
+    console.log(
+      `  Journal cross-check inconclusive (aggregator may still be catching up): ${(err as Error).message}`,
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// INTENT LOOKUP (for `pnpm cancel`)
+// ----------------------------------------------------------------------------
+
+/** Wire shape of the `intent` sub-object in an apps/api journal entry (bigints as strings). */
+export type JournalIntent = {
+  intentId: string;
+  creator: string;
+  inputToken: string;
+  outputToken: string;
+  inputAmount: string;
+  minOutputAmount: string;
+  deadline: string;
+  allowPartialFill: boolean;
+  srcChain: number;
+  dstChain: number;
+  srcAddress: string;
+  dstAddress: string;
+  solver: string;
+  data: string;
+};
+
+/** A journal entry as returned by `/intent/user/:addr` and `/intent/:hash`. */
+export type JournalEntry = {
+  intentHash: string;
+  txHash: string;
+  open: boolean;
+  intent: JournalIntent;
+  events?: Array<{ eventType: string; txHash: string }>;
+};
+
+/** Rehydrate the SDK `Intent` (bigints) from the journal's wire shape. The struct is decoded
+ *  from the on-chain `IntentCreated` event, so it round-trips to the same intentHash — exactly
+ *  what `cancelIntent` needs. `srcChain`/`dstChain` are relay chain ids (bigint). */
+export function journalIntentToSdkIntent(j: JournalIntent): Intent {
+  return {
+    intentId: BigInt(j.intentId),
+    creator: j.creator as Address,
+    inputToken: j.inputToken as Address,
+    outputToken: j.outputToken as Address,
+    inputAmount: BigInt(j.inputAmount),
+    minOutputAmount: BigInt(j.minOutputAmount),
+    deadline: BigInt(j.deadline),
+    allowPartialFill: j.allowPartialFill,
+    srcChain: BigInt(j.srcChain) as Intent['srcChain'],
+    dstChain: BigInt(j.dstChain) as Intent['dstChain'],
+    srcAddress: j.srcAddress as Hex,
+    dstAddress: j.dstAddress as Hex,
+    solver: j.solver as Address,
+    data: j.data as Hex,
+  };
+}
+
+/**
+ * Resolve an `intentId` to its journal entry by scanning the wallet's recent intents
+ * (`GET /intent/user/:addr`). The journal has no by-id route, so we filter the user's history.
+ * Prefers an `open` instance (the cancellable one). Returns null if not found in the latest page.
+ *
+ * NOTE: only the most recent ~100 intents for the wallet are scanned — sufficient for a PoC
+ * test wallet; a busier wallet would need pagination via `offset`.
+ */
+export async function findIntentById(
+  apiBaseUrl: string,
+  userAddress: string,
+  intentId: string,
+): Promise<JournalEntry | null> {
+  const url = `${apiBaseUrl}/intent/user/${userAddress}?limit=100`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`intent history fetch failed: HTTP ${response.status} (${url})`);
+  }
+  const body = (await response.json()) as { items?: JournalEntry[] };
+  const matches = (body.items ?? []).filter((i) => i.intent?.intentId === intentId);
+  if (matches.length === 0) return null;
+  return matches.find((m) => m.open) ?? matches[0];
 }

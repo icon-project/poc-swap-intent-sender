@@ -1,28 +1,26 @@
 import dotenv from 'dotenv';
-import { type Address, type Hex, getAddress } from 'viem';
-import { sonic } from 'viem/chains';
-import { IntentsAbi } from './intents.abi';
+import type { Address } from 'viem';
+import { Sodax, type CreateIntentParams } from '@sodax/sdk';
+import { getSolverConfig } from '@sodax/types';
 import {
   type TestCaseName,
   TEST_CASES,
-  addressToBytes,
   approveIfNeeded,
   buildSubmitPayload,
   createClients,
-  extractIntentFromReceipt,
-  getAddressEnv,
   getBigIntEnv,
   getBooleanEnv,
-  getHexEnv,
   getInputAmount,
   getMinOutputAmount,
   getRequiredEnv,
   normalizePrivateKey,
   formatElapsed,
   pollIntentStatus,
+  crossCheckIntentJournal,
   submitIntent,
   unixNow,
 } from './helpers';
+import { CHAIN_DEFS, ViemWalletProvider, getRpcUrl } from './sdk-helpers';
 
 dotenv.config();
 
@@ -50,111 +48,144 @@ function getTestCaseFromArgs(): TestCaseName {
 // ----------------------------------------------------------------------------
 // MAIN
 // ----------------------------------------------------------------------------
+//
+// swaps v2 flow (Sonic same-chain USDT <-> USDC):
+//   1. approve the intents contract to spend the input ERC20
+//   2. build + broadcast the create-intent tx via the SDK (returns { tx, intent, relayData })
+//   3. submit { txHash, srcChainKey, intent, relayData } to POST /v1/swaps/submit-tx
+//   4. PRIMARY: poll GET /v1/swaps/submit-tx/status until terminal (the endpoint under test)
+//   5. cross-check the intent journal (apps/api) for independent on-chain confirmation
+//
+// Unlike the v1 PoC, the intent is built by the SDK (correct relay chain ids + relay data)
+// rather than hand-rolled, so there is no on-chain ABI decode and no INTENT_CONTRACT_ADDRESS.
 
 async function main() {
   const testCaseName = getTestCaseFromArgs();
   const testCase = TEST_CASES[testCaseName];
 
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
-  const contractAddress = getAddress(getRequiredEnv('INTENT_CONTRACT_ADDRESS'));
-  const rpcUrl = process.env.SONIC_RPC_URL || 'https://rpc.soniclabs.com';
+  const sonicDef = CHAIN_DEFS['sonic'];
+  const rpcUrl = getRpcUrl(sonicDef);
   const backendBaseUrl =
-    process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/bes/swaps';
+    process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/swaps';
+
+  // Status is read from the intent journal via apps/api (NOT swaps-api submit-tx/status).
+  // The journal is on-chain-derived, so any deployment works; default to canary (apiv1-1).
+  const apiBaseUrl =
+    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
 
   const { account, walletClient, publicClient } = createClients(rpcUrl, privateKey);
+  const walletProvider = new ViemWalletProvider(privateKey, sonicDef.viemChain, rpcUrl);
 
   const inputAmount = getInputAmount(testCase);
   const minOutputAmount = getMinOutputAmount(inputAmount);
-  const deadline = getBigIntEnv('DEADLINE_UNIX', unixNow() + 3600n);
+  // Deadline: absolute `DEADLINE_UNIX` wins if set, else `now + DEADLINE_OFFSET_SECONDS`
+  // (default 1h). The relative offset is recomputed each run so it never goes stale.
+  const deadline = process.env.DEADLINE_UNIX
+    ? getBigIntEnv('DEADLINE_UNIX', unixNow())
+    : unixNow() + getBigIntEnv('DEADLINE_OFFSET_SECONDS', 3600n);
   const allowPartialFill = getBooleanEnv('ALLOW_PARTIAL_FILL', false);
-  const srcChain = getBigIntEnv('SRC_CHAIN', 146n);
-  const dstChain = getBigIntEnv('DST_CHAIN', 146n);
-  const solver = getAddressEnv(
-    'SOLVER_ADDRESS',
-    getAddress('0x0000000000000000000000000000000000000000'),
-  );
-  const data = getHexEnv('INTENT_DATA', '0x');
-  const gas = getBigIntEnv('GAS_LIMIT', 2_000_000n);
+  const intentsContract = getSolverConfig().intentsContract as Address;
   const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS ?? '3000');
   const pollTimeoutMs = Number(process.env.POLL_TIMEOUT_MS ?? '120000');
 
   const startMs = Date.now();
 
-  console.log(`\nSODAX Swap Intent — ${testCase.name}`);
+  console.log(`\nSODAX Swap Intent (v2) — ${testCase.name}`);
   console.log(`Wallet  : ${account.address}`);
   console.log(`Backend : ${backendBaseUrl}`);
   console.log(`RPC     : ${rpcUrl}`);
 
-  // Step 1: Check balance & approve
+  // Step 1: Check balance & approve the intents contract (Sonic-source intents are not
+  // bundled with an approval multicall by the SDK, so we approve up front).
   console.log(`\n[1/5] Check balance & approve`);
   await approveIfNeeded({
     publicClient,
     walletClient,
     account,
     token: testCase.inputToken,
-    spender: contractAddress,
+    spender: intentsContract,
     amount: inputAmount,
     decimals: testCase.decimals,
   });
 
-  // Step 2: Create intent on-chain
-  console.log(`\n[2/5] Create intent on-chain`);
-  console.log(`  Contract : ${contractAddress}`);
-  console.log(`  Input    : ${inputAmount.toString()} of ${testCase.inputToken}`);
-  console.log(`  Output   : min ${minOutputAmount.toString()} of ${testCase.outputToken}`);
-  console.log(
-    `  Deadline : ${deadline.toString()} (${new Date(Number(deadline) * 1000).toISOString()})`,
-  );
-  console.log(`  Chains   : ${srcChain} -> ${dstChain}`);
-
-  const intent = {
-    intentId: 0n,
-    creator: account.address,
+  // Step 2: Build + broadcast the create-intent tx via the SDK
+  console.log(`\n[2/5] Create intent on-chain via SDK`);
+  const intentParams: CreateIntentParams = {
     inputToken: testCase.inputToken,
     outputToken: testCase.outputToken,
     inputAmount,
     minOutputAmount,
     deadline,
     allowPartialFill,
-    srcChain,
-    dstChain,
-    srcAddress: addressToBytes(account.address),
-    dstAddress: addressToBytes(account.address),
-    solver,
-    data,
-  } as const;
+    srcChainKey: 'sonic',
+    dstChainKey: 'sonic',
+    srcAddress: account.address.toLowerCase(),
+    dstAddress: account.address.toLowerCase(),
+    solver: '0x0000000000000000000000000000000000000000',
+    data: '0x',
+  };
 
-  const hash = await walletClient.writeContract({
-    chain: sonic,
-    account,
-    address: contractAddress,
-    abi: IntentsAbi,
-    functionName: 'createIntent',
-    args: [intent],
-    gas,
-  });
+  console.log(`  Intents contract: ${intentsContract}`);
+  console.log(`  Input    : ${inputAmount.toString()} of ${testCase.inputToken}`);
+  console.log(`  Output   : min ${minOutputAmount.toString()} of ${testCase.outputToken}`);
+  console.log(
+    `  Deadline : ${deadline.toString()} (${new Date(Number(deadline) * 1000).toISOString()})`,
+  );
 
-  console.log(`  Tx sent: ${hash}`);
+  const createResult = await sodaxCreateIntent(intentParams, walletProvider);
+  const { tx: txHash, intent, relayData } = createResult;
+  console.log(`  Tx sent  : ${txHash}`);
+  console.log(`  Intent ID: ${intent.intentId.toString()}`);
   console.log(`  Waiting for confirmation...`);
 
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
   console.log(`  Confirmed in block ${receipt.blockNumber} | gas used: ${receipt.gasUsed}`);
 
-  // Step 3: Extract intent from receipt
-  console.log(`\n[3/5] Extract intent from receipt`);
-  const decodedIntent = extractIntentFromReceipt(receipt);
-
-  // Step 4: Submit to backend
-  console.log(`\n[4/5] Submit to backend`);
-  const payload = buildSubmitPayload(hash, account.address, decodedIntent);
+  // Step 3: Submit to backend
+  console.log(`\n[3/5] Submit to backend`);
+  const payload = buildSubmitPayload(
+    txHash as `0x${string}`,
+    account.address,
+    'sonic',
+    intent,
+    relayData.payload,
+  );
   await submitIntent(payload, backendBaseUrl);
 
-  // Step 5: Poll status
-  console.log(`\n[5/5] Poll status`);
-  await pollIntentStatus(hash, backendBaseUrl, pollIntervalMs, pollTimeoutMs);
+  // Step 4: PRIMARY status — the swaps-api v2 submit-tx/status route (the endpoint under test).
+  console.log(`\n[4/5] Poll swaps-api submit-tx/status`);
+  await pollIntentStatus(txHash as string, backendBaseUrl, pollIntervalMs, pollTimeoutMs, 'sonic');
+
+  // Step 5: Independent on-chain confirmation via the intent journal (apps/api). For a Sonic
+  // same-chain swap the broadcast tx IS the hub intent tx, so we look it up precisely by txHash.
+  console.log(`\n[5/5] Cross-check intent journal`);
+  const crossCheckTimeoutMs = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS ?? '90000');
+  await crossCheckIntentJournal(
+    apiBaseUrl,
+    { txHash: txHash as string },
+    pollIntervalMs,
+    crossCheckTimeoutMs,
+  );
 
   console.log(`\nElapsed: ${formatElapsed(startMs)}`);
   console.log(`Done`);
+}
+
+// Thin wrapper so the createIntent call site stays readable; throws on the SDK Result error.
+async function sodaxCreateIntent(params: CreateIntentParams, walletProvider: ViemWalletProvider) {
+  const sodax = new Sodax();
+  const result = await sodax.swaps.createIntent({
+    params,
+    // biome-ignore lint/suspicious/noExplicitAny: walletProvider is EVM; param type is the full chain-key union
+    walletProvider: walletProvider as any,
+  });
+  if (!result.ok) {
+    throw new Error(
+      `Intent creation failed: ${JSON.stringify(result.error, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}`,
+    );
+  }
+  return result.value;
 }
 
 main().catch((error) => {

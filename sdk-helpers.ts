@@ -9,17 +9,25 @@ import {
   formatEther,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { sonic, base, optimism, arbitrum, avalanche, bsc, polygon, mainnet, hyperEvm, lightlinkPhoenix, redbellyMainnet, kaia } from 'viem/chains';
+import {
+  sonic,
+  base,
+  optimism,
+  arbitrum,
+  avalanche,
+  bsc,
+  polygon,
+  mainnet,
+  hyperEvm,
+  lightlinkPhoenix,
+  redbellyMainnet,
+  kaia,
+} from 'viem/chains';
 import {
   type IEvmWalletProvider,
   type EvmRawTransaction,
   type EvmRawTransactionReceipt,
-  type SpokeChainId,
-  type EvmSpokeChainConfig,
-  type SonicSpokeChainConfig,
-  spokeChainConfig,
-  EvmSpokeProvider,
-  SonicSpokeProvider,
+  type SpokeChainKey,
 } from '@sodax/sdk';
 
 // ----------------------------------------------------------------------------
@@ -27,6 +35,8 @@ import {
 // ----------------------------------------------------------------------------
 
 export class ViemWalletProvider implements IEvmWalletProvider {
+  // v2 SDK uses `chainType` as the discriminant to refine wallet providers.
+  readonly chainType = 'EVM' as const;
   private walletClient;
   private publicClient;
 
@@ -104,7 +114,7 @@ export class ViemWalletProvider implements IEvmWalletProvider {
 // ----------------------------------------------------------------------------
 
 export type ChainDef = {
-  spokeChainId: SpokeChainId;
+  chainKey: SpokeChainKey;
   viemChain: Chain;
   name: string;
   nativeSymbol: string;
@@ -114,7 +124,7 @@ export type ChainDef = {
 
 export const CHAIN_DEFS: Record<string, ChainDef> = {
   sonic: {
-    spokeChainId: 'sonic',
+    chainKey: 'sonic',
     viemChain: sonic,
     name: 'Sonic',
     nativeSymbol: 'S',
@@ -122,7 +132,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'SONIC_RPC_URL',
   },
   base: {
-    spokeChainId: '0x2105.base',
+    chainKey: '0x2105.base',
     viemChain: base,
     name: 'Base',
     nativeSymbol: 'ETH',
@@ -130,7 +140,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'BASE_RPC_URL',
   },
   optimism: {
-    spokeChainId: '0xa.optimism',
+    chainKey: '0xa.optimism',
     viemChain: optimism,
     name: 'Optimism',
     nativeSymbol: 'ETH',
@@ -138,7 +148,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'OPTIMISM_RPC_URL',
   },
   arbitrum: {
-    spokeChainId: '0xa4b1.arbitrum',
+    chainKey: '0xa4b1.arbitrum',
     viemChain: arbitrum,
     name: 'Arbitrum',
     nativeSymbol: 'ETH',
@@ -146,7 +156,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'ARBITRUM_RPC_URL',
   },
   avalanche: {
-    spokeChainId: '0xa86a.avax',
+    chainKey: '0xa86a.avax',
     viemChain: avalanche,
     name: 'Avalanche',
     nativeSymbol: 'AVAX',
@@ -154,7 +164,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'AVALANCHE_RPC_URL',
   },
   bsc: {
-    spokeChainId: '0x38.bsc',
+    chainKey: '0x38.bsc',
     viemChain: bsc,
     name: 'BSC',
     nativeSymbol: 'BNB',
@@ -162,7 +172,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'BSC_RPC_URL',
   },
   polygon: {
-    spokeChainId: '0x89.polygon',
+    chainKey: '0x89.polygon',
     viemChain: polygon,
     name: 'Polygon',
     nativeSymbol: 'POL',
@@ -170,7 +180,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'POLYGON_RPC_URL',
   },
   ethereum: {
-    spokeChainId: 'ethereum',
+    chainKey: 'ethereum',
     viemChain: mainnet,
     name: 'Ethereum',
     nativeSymbol: 'ETH',
@@ -178,7 +188,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'ETHEREUM_RPC_URL',
   },
   hyper: {
-    spokeChainId: 'hyper',
+    chainKey: 'hyper',
     viemChain: hyperEvm,
     name: 'Hyperliquid',
     nativeSymbol: 'HYPE',
@@ -186,7 +196,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'HYPER_RPC_URL',
   },
   lightlink: {
-    spokeChainId: 'lightlink',
+    chainKey: 'lightlink',
     viemChain: lightlinkPhoenix,
     name: 'LightLink',
     nativeSymbol: 'ETH',
@@ -194,7 +204,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'LIGHTLINK_RPC_URL',
   },
   redbelly: {
-    spokeChainId: 'redbelly',
+    chainKey: 'redbelly',
     viemChain: redbellyMainnet,
     name: 'Redbelly',
     nativeSymbol: 'RBNT',
@@ -202,7 +212,7 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
     rpcEnvVar: 'REDBELLY_RPC_URL',
   },
   kaia: {
-    spokeChainId: '0x2019.kaia',
+    chainKey: '0x2019.kaia',
     viemChain: kaia,
     name: 'Kaia',
     nativeSymbol: 'KAIA',
@@ -413,26 +423,16 @@ export const RETURN_HOPS: HopDef[] = [
 ];
 
 // ----------------------------------------------------------------------------
-// SPOKE PROVIDER FACTORY
+// RPC URL RESOLVER
 // ----------------------------------------------------------------------------
+//
+// v2 note: the SDK no longer needs a hand-built `SpokeProvider`. `swaps.createIntent`
+// (broadcast mode) takes the `IEvmWalletProvider` directly and resolves the spoke
+// provider internally from `params.srcChainKey`, so the old `createSpokeProvider`
+// factory (and the `SonicSpokeProvider`/`spokeChainConfig` plumbing) is gone.
 
 export function getRpcUrl(chainDef: ChainDef): string {
   return process.env[chainDef.rpcEnvVar] || chainDef.defaultRpcUrl;
-}
-
-export function createSpokeProvider(
-  chainDef: ChainDef,
-  walletProvider: IEvmWalletProvider,
-): SonicSpokeProvider | EvmSpokeProvider {
-  const rpcUrl = getRpcUrl(chainDef);
-
-  if (chainDef.spokeChainId === 'sonic') {
-    const config = spokeChainConfig['sonic'] as SonicSpokeChainConfig;
-    return new SonicSpokeProvider(walletProvider, config, rpcUrl);
-  }
-
-  const config = spokeChainConfig[chainDef.spokeChainId] as EvmSpokeChainConfig;
-  return new EvmSpokeProvider(walletProvider, config, rpcUrl);
 }
 
 // ----------------------------------------------------------------------------
@@ -450,34 +450,6 @@ export async function getNativeBalance(
 
 export function formatNativeBalance(balance: bigint, symbol: string): string {
   return `${formatEther(balance)} ${symbol}`;
-}
-
-// ----------------------------------------------------------------------------
-// SONIC USER ROUTER ADDRESS
-// ----------------------------------------------------------------------------
-
-const sonicWalletFactoryGetDeployedAddressAbi = [
-  {
-    inputs: [{ internalType: 'address', name: 'user', type: 'address' }],
-    name: 'getDeployedAddress',
-    outputs: [{ internalType: 'address', name: 'computedAddress', type: 'address' }],
-    stateMutability: 'view',
-    type: 'function',
-  },
-] as const;
-
-export async function getUserRouterAddress(
-  rpcUrl: string,
-  walletAddress: Address,
-): Promise<Address> {
-  const client = createPublicClient({ chain: sonic, transport: http(rpcUrl) });
-  const walletRouter = spokeChainConfig['sonic'].addresses.walletRouter;
-  return client.readContract({
-    address: walletRouter,
-    abi: sonicWalletFactoryGetDeployedAddressAbi,
-    functionName: 'getDeployedAddress',
-    args: [walletAddress],
-  });
 }
 
 // ----------------------------------------------------------------------------

@@ -2,7 +2,6 @@ import 'dotenv/config';
 import { writeFileSync } from 'fs';
 import { type Address, type Hex, parseUnits, formatUnits } from 'viem';
 import { Sodax, type CreateIntentParams } from '@sodax/sdk';
-import type { SpokeChainId } from '@sodax/types';
 import {
   getRequiredEnv,
   normalizePrivateKey,
@@ -11,9 +10,10 @@ import {
   unixNow,
   submitIntent,
   pollIntentStatus,
+  crossCheckIntentJournal,
+  buildSubmitPayload,
   overwriteLine,
   formatElapsed,
-  type SubmitTxPayload,
 } from './helpers';
 import {
   type HopDef,
@@ -24,7 +24,6 @@ import {
   SONIC_USDT,
   NATIVE as NATIVE_ADDR,
   ViemWalletProvider,
-  createSpokeProvider,
   getNativeBalance,
   formatNativeBalance,
   getRpcUrl,
@@ -50,7 +49,7 @@ const GAS_BUFFERS: Record<string, bigint> = {
   avalanche: parseUnits('0.01', 18), // AVAX
   bsc: parseUnits('0.001', 18), // BNB
   polygon: parseUnits('0.1', 18), // POL
-  ethereum: parseUnits('0.005', 18), // ETH (L1, higher gas)
+  ethereum: parseUnits('0.001', 18), // ETH (L1, higher gas)
   hyper: parseUnits('0.01', 18), // HYPE
   lightlink: parseUnits('0.0001', 18), // ETH (cheap gas)
   redbelly: parseUnits('0.01', 18), // RBNT
@@ -105,8 +104,8 @@ async function executeHop(
   const walletAddress = await walletProvider.getWalletAddress();
 
   console.log(`  Wallet    : ${walletAddress}`);
-  console.log(`  Source    : ${srcChain.name} (${srcChain.spokeChainId})`);
-  console.log(`  Dest      : ${dstChain.name} (${dstChain.spokeChainId})`);
+  console.log(`  Source    : ${srcChain.name} (${srcChain.chainKey})`);
+  console.log(`  Dest      : ${dstChain.name} (${dstChain.chainKey})`);
 
   // Determine input amount
   let inputAmount: bigint;
@@ -181,7 +180,7 @@ async function executeHop(
   // ERC20 approval for Sonic hub: the SDK's createSwapIntent sends tx directly
   // to the intents contract, which calls transferFrom on the ERC20.
   // The spender is the intents contract address.
-  if (!isNativeInput && srcChain.spokeChainId === 'sonic') {
+  if (!isNativeInput && srcChain.chainKey === 'sonic') {
     const publicClient = createPublicClient({
       chain: srcChain.viemChain,
       transport: http(srcRpcUrl),
@@ -189,7 +188,7 @@ async function executeHop(
 
     // Get the intents contract address from SDK config
     const { getSolverConfig } = await import('@sodax/types');
-    const intentsContract = getSolverConfig('sonic').intentsContract as Address;
+    const intentsContract = getSolverConfig().intentsContract as Address;
     console.log(`  Intents contract: ${intentsContract}`);
 
     const allowance = await publicClient.readContract({
@@ -223,7 +222,7 @@ async function executeHop(
     }
   }
 
-  // Build intent params
+  // Build intent params (v2: chain KEYS, not chain ids)
   const deadline = unixNow() + 3600n;
   const intentParams: CreateIntentParams = {
     inputToken: hop.inputToken,
@@ -232,8 +231,8 @@ async function executeHop(
     minOutputAmount: 0n,
     deadline,
     allowPartialFill: false,
-    srcChain: srcChain.spokeChainId as SpokeChainId,
-    dstChain: dstChain.spokeChainId as SpokeChainId,
+    srcChainKey: srcChain.chainKey,
+    dstChainKey: dstChain.chainKey,
     srcAddress: walletAddress.toLowerCase(),
     dstAddress: walletAddress.toLowerCase(),
     solver: ZERO_ADDRESS,
@@ -246,28 +245,28 @@ async function executeHop(
   console.log(`    inputAmount    : ${intentParams.inputAmount.toString()}`);
   console.log(`    minOutputAmount: ${intentParams.minOutputAmount.toString()}`);
   console.log(`    deadline       : ${intentParams.deadline.toString()}`);
-  console.log(`    srcChain       : ${intentParams.srcChain}`);
-  console.log(`    dstChain       : ${intentParams.dstChain}`);
+  console.log(`    srcChainKey    : ${intentParams.srcChainKey}`);
+  console.log(`    dstChainKey    : ${intentParams.dstChainKey}`);
 
-  // Create spoke provider for source chain
-  const spokeProvider = createSpokeProvider(srcChain, walletProvider);
-
-  // Step 1: Create intent on-chain via SDK (does NOT submit to solver)
+  // Step 1: Create intent on-chain via SDK (broadcast mode — does NOT submit to solver).
+  // v2: pass the wallet provider directly; the SDK resolves the spoke provider from srcChainKey.
   console.log(`\n  Creating intent on-chain via SDK...`);
 
   const createResult = await sodax.swaps.createIntent({
-    intentParams,
-    spokeProvider: spokeProvider as any,
-    raw: false,
+    params: intentParams,
+    // biome-ignore lint/suspicious/noExplicitAny: walletProvider is EVM; param type is the full chain-key union
+    walletProvider: walletProvider as any,
   });
 
   if (!createResult.ok) {
     console.error(`  Intent creation failed!`);
     console.error(`  Error:`, createResult.error);
-    throw new Error(`Intent creation failed: ${JSON.stringify(createResult.error, (_, v) => typeof v === 'bigint' ? v.toString() : v)}`);
+    throw new Error(
+      `Intent creation failed: ${JSON.stringify(createResult.error, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}`,
+    );
   }
 
-  const [txHash, intent, relayData] = createResult.value;
+  const { tx: txHash, intent, relayData } = createResult.value;
   console.log(`  Intent created on-chain!`);
   console.log(`  Tx hash   : ${txHash}`);
   console.log(`  Intent ID : ${intent.intentId.toString()}`);
@@ -283,55 +282,49 @@ async function executeHop(
   });
   console.log(`  Confirmed in block ${receipt.blockNumber}`);
 
-  // Step 3: Submit to BES backend
-  const backendUrl =
-    process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/bes/swaps';
+  // Step 3: Submit to the swaps v2 backend
+  const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/swaps';
 
-  const payload: SubmitTxPayload = {
-    txHash: txHash as `0x${string}`,
-    srcChainId: srcChain.spokeChainId,
+  const payload = buildSubmitPayload(
+    txHash as `0x${string}`,
     walletAddress,
-    intent: {
-      intentId: intent.intentId.toString(),
-      creator: intent.creator,
-      inputToken: intent.inputToken,
-      outputToken: intent.outputToken,
-      inputAmount: intent.inputAmount.toString(),
-      minOutputAmount: intent.minOutputAmount.toString(),
-      deadline: intent.deadline.toString(),
-      allowPartialFill: intent.allowPartialFill,
-      srcChain: intent.srcChain.toString(),
-      dstChain: intent.dstChain.toString(),
-      srcAddress: intent.srcAddress,
-      dstAddress: intent.dstAddress,
-      solver: intent.solver,
-      data: intent.data,
-    },
-    relayData,
-  };
+    srcChain.chainKey,
+    intent,
+    relayData.payload,
+  );
 
-  console.log(`\n  Submitting to BES...`);
+  console.log(`\n  Submitting to swaps v2...`);
   await submitIntent(payload, backendUrl);
 
-  // Step 4: Poll BES for status
-  console.log(`\n  Polling BES for status...`);
+  // Step 4: PRIMARY status — poll the swaps-api v2 submit-tx/status route (keyed by the
+  // source-chain txHash + srcChainKey, exactly what we submitted).
+  console.log(`\n  Polling swaps-api submit-tx/status...`);
   const pollInterval = Number(process.env.POLL_INTERVAL_MS || '3000');
   const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
 
   let hopStatus: 'executed' | 'failed' | 'timeout' = 'timeout';
   try {
-    const pollResult = await pollIntentStatus(
+    const result = await pollIntentStatus(
       txHash as string,
       backendUrl,
       pollInterval,
       pollTimeout,
-      srcChain.spokeChainId,
+      srcChain.chainKey,
     );
-    const s = (pollResult?.data as Record<string, unknown> | undefined)?.status;
+    const s = (result?.data as Record<string, unknown> | undefined)?.status;
     hopStatus = s === 'executed' ? 'executed' : 'failed';
   } catch {
     hopStatus = 'timeout';
   }
+
+  // Step 5: Independent on-chain confirmation via the intent journal. Cross-chain hops
+  // broadcast on the spoke chain, so the journal (keyed by the hub tx) is looked up by
+  // intentHash, not the spoke txHash. On-chain-derived → default to canary (apiv1-1).
+  const apiBaseUrl =
+    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  const intentHash = sodax.swaps.getIntentHash(intent);
+  const crossCheckTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
+  await crossCheckIntentJournal(apiBaseUrl, { intentHash }, pollInterval, crossCheckTimeout);
 
   const elapsedMs = Date.now() - hopStart;
   console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
@@ -413,7 +406,11 @@ function buildHop(srcKey: string, dstKey: string): HopDef {
 // ALL HOPS EXECUTION
 // ----------------------------------------------------------------------------
 
-async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
+async function executeAllHops(
+  sodax: Sodax,
+  privateKey: Hex,
+  startChain?: string,
+): Promise<void> {
   const disabled = getDisabledChains();
   const effectiveHops = buildEffectiveHops(FORWARD_HOPS, disabled);
 
@@ -423,8 +420,23 @@ async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
   }
 
   // Extract ordered destination sequence and starting chain
-  const destinations: string[] = effectiveHops.map((h) => h.dstChainKey);
+  let destinations: string[] = effectiveHops.map((h) => h.dstChainKey);
   let currentChain = effectiveHops[0].srcChainKey;
+
+  // Resume mid-sequence: --from <chainKey> drops every leg up to and including the
+  // start chain, then continues with the normal rewire logic from there.
+  if (startChain && startChain !== currentChain) {
+    const idx = destinations.indexOf(startChain);
+    if (idx === -1) {
+      throw new Error(
+        `--from chain '${startChain}' is not in the effective sequence ` +
+          `(${[currentChain, ...destinations].join(' -> ')})`,
+      );
+    }
+    currentChain = startChain;
+    destinations = destinations.slice(idx + 1);
+    console.log(`Resuming from ${CHAIN_DEFS[currentChain].name} (--from ${startChain})`);
+  }
 
   if (disabled.size > 0) {
     console.log(`Effective destination sequence (${destinations.length} destinations):`);
@@ -448,9 +460,12 @@ async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
     console.log(`${'='.repeat(60)}`);
 
     // If the hop was rewired (source differs from original), note it
-    const originalSrc = i === 0 ? effectiveHops[0].srcChainKey : effectiveHops[i - 1]?.dstChainKey ?? currentChain;
+    const originalSrc =
+      i === 0 ? effectiveHops[0].srcChainKey : (effectiveHops[i - 1]?.dstChainKey ?? currentChain);
     if (currentChain !== originalSrc) {
-      console.log(`  (rewired: funds are on ${CHAIN_DEFS[currentChain].name}, skipping failed intermediate)`);
+      console.log(
+        `  (rewired: funds are on ${CHAIN_DEFS[currentChain].name}, skipping failed intermediate)`,
+      );
     }
 
     let result: HopResult;
@@ -485,32 +500,52 @@ async function executeAllHops(sodax: Sodax, privateKey: Hex): Promise<void> {
           dstRpcUrl,
         ).getWalletAddress()) as Address;
 
+        // The next hop spends from this chain, so it needs more than the gas buffer.
+        // Wait on that absolute threshold rather than a strict increase: the journal
+        // cross-check above can take long enough that funds already landed before this
+        // snapshot, which made the old "balance must increase" check time out on success.
+        const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
         const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
         console.log(
-          `\n  ${dstChain.name} balance before: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)}`,
+          `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
+            `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
         );
-        console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
 
-        const pollInterval = 10_000;
-        const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
-        const deadline = Date.now() + pollTimeout;
+        if (balanceBefore > nextGasBuffer) {
+          console.log(`  Already funded above gas buffer, proceeding to next hop.`);
+        } else {
+          console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
 
-        let balanceInPlace = false;
-        while (Date.now() < deadline) {
-          await sleep(pollInterval);
-          const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-          if (balance > balanceBefore) {
-            if (balanceInPlace) process.stdout.write('\n');
-            const received = balance - balanceBefore;
-            console.log(
-              `  Received ${formatNativeBalance(received, dstChain.nativeSymbol)}, proceeding to next hop.`,
+          const pollInterval = 10_000;
+          // Hub->spoke native delivery can lag well past the swap-status timeout
+          // (some legs take >5 min), so give arrival its own, more generous budget.
+          const pollTimeout = Number(process.env.ARRIVAL_TIMEOUT_MS || '900000');
+          const deadline = Date.now() + pollTimeout;
+
+          let balanceInPlace = false;
+          let funded = false;
+          while (Date.now() < deadline) {
+            await sleep(pollInterval);
+            const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+            if (balance > nextGasBuffer) {
+              if (balanceInPlace) process.stdout.write('\n');
+              console.log(
+                `  Balance now ${formatNativeBalance(balance, dstChain.nativeSymbol)}, proceeding to next hop.`,
+              );
+              funded = true;
+              break;
+            }
+            overwriteLine(
+              `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
             );
-            break;
+            balanceInPlace = true;
           }
-          overwriteLine(
-            `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
-          );
-          balanceInPlace = true;
+          if (!funded) {
+            if (balanceInPlace) process.stdout.write('\n');
+            console.log(
+              `  Timed out waiting for funds on ${dstChain.name}; proceeding anyway (next hop re-checks).`,
+            );
+          }
         }
       }
     } else {
@@ -665,7 +700,9 @@ function printUsage(): void {
   console.log(`  --balances               Show native balance on every chain`);
   console.log(`  --sweep                  Swap all remote native balances back to USDT on Sonic\n`);
   console.log(`Full chain:`);
-  console.log(`  --all                    Run all ${FORWARD_HOPS.length} forward hops sequentially\n`);
+  console.log(
+    `  --all                    Run all ${FORWARD_HOPS.length} forward hops sequentially\n`,
+  );
   console.log(`Forward hops:`);
   for (const hop of FORWARD_HOPS) {
     console.log(`  --${hop.id.padEnd(25)} ${hop.label}`);
@@ -713,7 +750,14 @@ async function main(): Promise<void> {
   const target = FLAG_TO_HOP[flag];
 
   if (Array.isArray(target)) {
-    await executeAllHops(sodax, privateKey);
+    // Optional `--from <chainKey>` (or `--from=<chainKey>`) to resume mid-sequence.
+    const rest = process.argv.slice(3);
+    let startChain: string | undefined;
+    const fromEq = rest.find((a) => a.startsWith('--from='));
+    if (fromEq) startChain = fromEq.slice('--from='.length);
+    const fromIdx = rest.indexOf('--from');
+    if (fromIdx !== -1 && rest[fromIdx + 1]) startChain = rest[fromIdx + 1];
+    await executeAllHops(sodax, privateKey, startChain);
   } else {
     // Check if src or dst chain is disabled
     const disabled = getDisabledChains();

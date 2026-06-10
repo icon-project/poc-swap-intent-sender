@@ -10,6 +10,7 @@ import {
   unixNow,
   submitIntent,
   pollIntentStatus,
+  pollIntentJournal,
   crossCheckIntentJournal,
   buildSubmitPayload,
   overwriteLine,
@@ -70,6 +71,21 @@ type HopResult = {
   elapsedMs: number;
 };
 
+// Profiling extension of HopResult. The extra fields are only populated when a hop runs
+// under `--profile`; all are optional so a plain HopResult is still a valid HopProfile
+// (e.g. the failure-path results built in executeAllHops / main).
+type HopProfile = HopResult & {
+  createMs?: number; // SDK build + broadcast of the create-intent tx
+  confirmMs?: number; // waitForTransactionReceipt on the source chain
+  submitMs?: number; // POST /submit-tx round-trip
+  // Phase name -> ms elapsed from the broadcast anchor (tBroadcast), per source.
+  swapPhases?: Record<string, number>; // pending/relaying/relayed/posting_execution/executed/failed
+  journalPhases?: Record<string, number>; // first-seen/filled/cancelled/closed
+  swapExecutedMs?: number | null; // time-to-executed reported by swaps-api
+  journalFilledMs?: number | null; // time-to-filled reported by the intent journal
+  journalVsSwapDeltaMs?: number | null; // journalFilledMs - swapExecutedMs
+};
+
 // ----------------------------------------------------------------------------
 // FLAG -> HOP MAPPING
 // ----------------------------------------------------------------------------
@@ -91,7 +107,8 @@ async function executeHop(
   hop: HopDef,
   privateKey: Hex,
   hopIndex = 0,
-): Promise<HopResult> {
+  profile = false,
+): Promise<HopProfile> {
   const hopStart = Date.now();
   const srcChain = CHAIN_DEFS[hop.srcChainKey];
   const dstChain = CHAIN_DEFS[hop.dstChainKey];
@@ -252,6 +269,7 @@ async function executeHop(
   // v2: pass the wallet provider directly; the SDK resolves the spoke provider from srcChainKey.
   console.log(`\n  Creating intent on-chain via SDK...`);
 
+  const tCreateStart = Date.now();
   const createResult = await sodax.swaps.createIntent({
     params: intentParams,
     // biome-ignore lint/suspicious/noExplicitAny: walletProvider is EVM; param type is the full chain-key union
@@ -267,6 +285,9 @@ async function executeHop(
   }
 
   const { tx: txHash, intent, relayData } = createResult.value;
+  // Shared anchor for both status sources: the moment the create-intent tx is broadcast.
+  const tBroadcast = Date.now();
+  const createMs = tBroadcast - tCreateStart;
   console.log(`  Intent created on-chain!`);
   console.log(`  Tx hash   : ${txHash}`);
   console.log(`  Intent ID : ${intent.intentId.toString()}`);
@@ -277,9 +298,11 @@ async function executeHop(
     chain: srcChain.viemChain,
     transport: http(srcRpcUrl),
   });
+  const tConfirmStart = Date.now();
   const receipt = await srcPublicClient.waitForTransactionReceipt({
     hash: txHash as `0x${string}`,
   });
+  const confirmMs = Date.now() - tConfirmStart;
   console.log(`  Confirmed in block ${receipt.blockNumber}`);
 
   // Step 3: Submit to the swaps v2 backend
@@ -294,10 +317,92 @@ async function executeHop(
   );
 
   console.log(`\n  Submitting to swaps v2...`);
+  const tSubmitStart = Date.now();
   await submitIntent(payload, backendUrl);
+  const submitMs = Date.now() - tSubmitStart;
 
-  // Step 4: PRIMARY status — poll the swaps-api v2 submit-tx/status route (keyed by the
-  // source-chain txHash + srcChainKey, exactly what we submitted).
+  // Cross-chain hops broadcast on the spoke chain, so the journal (keyed by the hub tx) is
+  // looked up by intentHash, not the spoke txHash. On-chain-derived → default to canary.
+  const apiBaseUrl =
+    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  const intentHash = sodax.swaps.getIntentHash(intent);
+
+  if (profile) {
+    // PROFILE MODE: race the two status sources concurrently from the broadcast anchor so we
+    // can measure how long EACH independently takes to report the intent filled. Both pollers
+    // record per-phase transition timestamps relative to tBroadcast via onPhase.
+    console.log(
+      `\n  Profiling: racing swaps-api status vs intent journal from broadcast anchor...`,
+    );
+    const profileInterval = Number(process.env.PROFILE_POLL_INTERVAL_MS || '1500');
+    const swapTimeout = Number(process.env.POLL_TIMEOUT_MS || '300000');
+    const journalTimeout = Number(process.env.JOURNAL_PROFILE_TIMEOUT_MS || '300000');
+
+    const swapPhases: Record<string, number> = {};
+    const journalPhases: Record<string, number> = {};
+
+    await Promise.allSettled([
+      pollIntentStatus(
+        txHash as string,
+        backendUrl,
+        profileInterval,
+        swapTimeout,
+        srcChain.chainKey,
+        {
+          anchorMs: tBroadcast,
+          logPrefix: '[swap-api]',
+          onPhase: (p, at) => {
+            swapPhases[p] = at;
+          },
+        },
+      ),
+      pollIntentJournal(apiBaseUrl, { intentHash }, profileInterval, journalTimeout, {
+        anchorMs: tBroadcast,
+        logPrefix: '[journal] ',
+        onPhase: (p, at) => {
+          journalPhases[p] = at;
+        },
+      }),
+    ]);
+
+    const swapExecutedMs = swapPhases.executed ?? null;
+    const journalFilledMs = journalPhases.filled ?? null;
+    const journalVsSwapDeltaMs =
+      swapExecutedMs != null && journalFilledMs != null ? journalFilledMs - swapExecutedMs : null;
+
+    const hopStatus: HopResult['status'] =
+      swapPhases.executed != null ? 'executed' : swapPhases.failed != null ? 'failed' : 'timeout';
+
+    const elapsedMs = Date.now() - hopStart;
+    console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
+    if (swapExecutedMs != null) console.log(`  swaps-api executed at: ${swapExecutedMs}ms`);
+    if (journalFilledMs != null) console.log(`  journal filled at:     ${journalFilledMs}ms`);
+    if (journalVsSwapDeltaMs != null)
+      console.log(
+        `  journal vs swap-api:   ${journalVsSwapDeltaMs >= 0 ? '+' : ''}${journalVsSwapDeltaMs}ms`,
+      );
+
+    return {
+      hopIndex,
+      label: hop.label,
+      txHash: txHash as string,
+      intentId: intent.intentId.toString(),
+      inputAmount: inputAmountDisplay,
+      status: hopStatus,
+      elapsedMs,
+      createMs,
+      confirmMs,
+      submitMs,
+      swapPhases,
+      journalPhases,
+      swapExecutedMs,
+      journalFilledMs,
+      journalVsSwapDeltaMs,
+    };
+  }
+
+  // DEFAULT MODE: PRIMARY status — poll the swaps-api v2 submit-tx/status route (keyed by the
+  // source-chain txHash + srcChainKey), then a single soft journal cross-check.
   console.log(`\n  Polling swaps-api submit-tx/status...`);
   const pollInterval = Number(process.env.POLL_INTERVAL_MS || '3000');
   const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
@@ -317,12 +422,7 @@ async function executeHop(
     hopStatus = 'timeout';
   }
 
-  // Step 5: Independent on-chain confirmation via the intent journal. Cross-chain hops
-  // broadcast on the spoke chain, so the journal (keyed by the hub tx) is looked up by
-  // intentHash, not the spoke txHash. On-chain-derived → default to canary (apiv1-1).
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
-  const intentHash = sodax.swaps.getIntentHash(intent);
+  // Independent on-chain confirmation via the intent journal (soft, never fatal).
   const crossCheckTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
   await crossCheckIntentJournal(apiBaseUrl, { intentHash }, pollInterval, crossCheckTimeout);
 
@@ -384,6 +484,157 @@ function saveSummary(text: string): string {
 }
 
 // ----------------------------------------------------------------------------
+// PROFILE REPORTS (--profile)
+// ----------------------------------------------------------------------------
+
+const SWAP_PHASE_ORDER = [
+  'pending',
+  'relaying',
+  'relayed',
+  'posting_execution',
+  'executed',
+  'failed',
+];
+const JOURNAL_PHASE_ORDER = ['first-seen', 'filled', 'cancelled', 'closed'];
+
+function statRange(xs: number[]): string {
+  if (xs.length === 0) return 'n/a';
+  const avg = Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
+  return `min ${Math.min(...xs)}ms / avg ${avg}ms / max ${Math.max(...xs)}ms`;
+}
+
+function buildProfileText(results: HopProfile[]): string {
+  const sep = '='.repeat(80);
+  const divider = '-'.repeat(80);
+  const lines: string[] = [sep, 'CHAIN HOP TIMING PROFILE', sep];
+
+  for (const r of results) {
+    lines.push(`#${r.hopIndex}  ${r.label}`);
+    lines.push(
+      `    Status: ${r.status} | Wall: ${formatMs(r.elapsedMs)} | Tx: ${r.txHash || 'N/A'}`,
+    );
+    if (r.createMs != null) {
+      lines.push(
+        `    Steps : create ${r.createMs}ms | confirm ${r.confirmMs}ms | submit ${r.submitMs}ms`,
+      );
+    }
+    const sp = r.swapPhases ?? {};
+    const swapStr = SWAP_PHASE_ORDER.filter((p) => sp[p] != null)
+      .map((p) => `${p}=${sp[p]}ms`)
+      .join(', ');
+    lines.push(`    swap-api : ${swapStr || '(no phases recorded)'}`);
+    const jp = r.journalPhases ?? {};
+    const jStr = JOURNAL_PHASE_ORDER.filter((p) => jp[p] != null)
+      .map((p) => `${p}=${jp[p]}ms`)
+      .join(', ');
+    lines.push(`    journal  : ${jStr || '(no phases recorded)'}`);
+    if (r.swapExecutedMs != null || r.journalFilledMs != null) {
+      const d = r.journalVsSwapDeltaMs;
+      lines.push(
+        `    filled   : swap-api ${r.swapExecutedMs ?? 'n/a'}ms vs journal ${r.journalFilledMs ?? 'n/a'}ms` +
+          (d != null ? ` (journal ${d >= 0 ? '+' : ''}${d}ms)` : ''),
+      );
+    }
+    lines.push(divider);
+  }
+
+  const swapTimes = results.map((r) => r.swapExecutedMs).filter((v): v is number => v != null);
+  const journalTimes = results.map((r) => r.journalFilledMs).filter((v): v is number => v != null);
+  const deltas = results.map((r) => r.journalVsSwapDeltaMs).filter((v): v is number => v != null);
+
+  lines.push('AGGREGATE (across hops reporting a fill on that source)');
+  lines.push(`  swap-api time-to-executed: ${statRange(swapTimes)}  (n=${swapTimes.length})`);
+  lines.push(`  journal  time-to-filled  : ${statRange(journalTimes)}  (n=${journalTimes.length})`);
+  lines.push(`  journal - swap-api delta : ${statRange(deltas)}  (n=${deltas.length})`);
+  const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);
+  const executed = results.filter((r) => r.status === 'executed').length;
+  const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
+  const skipped = results.filter((r) => r.status === 'skipped').length;
+  lines.push(
+    `  Total wall-clock: ${formatMs(totalMs)} | Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`,
+  );
+  lines.push(sep);
+  return lines.join('\n');
+}
+
+function buildProfileCsv(results: HopProfile[]): string {
+  const header = [
+    'hopIndex',
+    'label',
+    'status',
+    'createMs',
+    'confirmMs',
+    'submitMs',
+    'swap_pending',
+    'swap_relaying',
+    'swap_relayed',
+    'swap_posting_execution',
+    'swap_executed',
+    'journal_first_seen',
+    'journal_filled',
+    'journalVsSwapDeltaMs',
+  ];
+  const cell = (v: number | null | undefined) => (v == null ? '' : String(v));
+  const esc = (s: string) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  const rows = results.map((r) => {
+    const sp = r.swapPhases ?? {};
+    const jp = r.journalPhases ?? {};
+    return [
+      String(r.hopIndex),
+      esc(r.label),
+      r.status,
+      cell(r.createMs),
+      cell(r.confirmMs),
+      cell(r.submitMs),
+      cell(sp.pending),
+      cell(sp.relaying),
+      cell(sp.relayed),
+      cell(sp.posting_execution),
+      cell(sp.executed),
+      cell(jp['first-seen']),
+      cell(jp.filled),
+      cell(r.journalVsSwapDeltaMs),
+    ].join(',');
+  });
+  return [header.join(','), ...rows].join('\n');
+}
+
+function saveProfileReports(results: HopProfile[]): { txt: string; json: string; csv: string } {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const base = `chain-hop-profile-${ts}`;
+  const files = { txt: `${base}.txt`, json: `${base}.json`, csv: `${base}.csv` };
+
+  const swapTimes = results.map((r) => r.swapExecutedMs).filter((v): v is number => v != null);
+  const journalTimes = results.map((r) => r.journalFilledMs).filter((v): v is number => v != null);
+  const deltas = results.map((r) => r.journalVsSwapDeltaMs).filter((v): v is number => v != null);
+  const agg = (xs: number[]) =>
+    xs.length === 0
+      ? null
+      : {
+          n: xs.length,
+          min: Math.min(...xs),
+          max: Math.max(...xs),
+          avg: Math.round(xs.reduce((a, b) => a + b, 0) / xs.length),
+        };
+
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    hops: results,
+    aggregate: {
+      swapExecutedMs: agg(swapTimes),
+      journalFilledMs: agg(journalTimes),
+      journalVsSwapDeltaMs: agg(deltas),
+      totalWallMs: results.reduce((s, r) => s + r.elapsedMs, 0),
+    },
+  };
+
+  writeFileSync(files.txt, buildProfileText(results) + '\n', 'utf-8');
+  writeFileSync(files.json, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
+  writeFileSync(files.csv, buildProfileCsv(results) + '\n', 'utf-8');
+  return files;
+}
+
+// ----------------------------------------------------------------------------
 // AD-HOC HOP BUILDER
 // ----------------------------------------------------------------------------
 
@@ -410,6 +661,7 @@ async function executeAllHops(
   sodax: Sodax,
   privateKey: Hex,
   startChain?: string,
+  profile = false,
 ): Promise<void> {
   const disabled = getDisabledChains();
   const effectiveHops = buildEffectiveHops(FORWARD_HOPS, disabled);
@@ -446,7 +698,7 @@ async function executeAllHops(
     }
   }
 
-  const results: HopResult[] = [];
+  const results: HopProfile[] = [];
 
   for (let i = 0; i < destinations.length; i++) {
     const dstKey = destinations[i];
@@ -468,9 +720,9 @@ async function executeAllHops(
       );
     }
 
-    let result: HopResult;
+    let result: HopProfile;
     try {
-      result = await executeHop(sodax, hop, privateKey, hopNum);
+      result = await executeHop(sodax, hop, privateKey, hopNum, profile);
     } catch (err: any) {
       console.error(`  Hop failed: ${err.message}`);
       result = {
@@ -557,10 +809,17 @@ async function executeAllHops(
   }
 
   // Print and save summary
-  const summary = buildSummaryText(results);
-  console.log(`\n${summary}`);
-  const file = saveSummary(summary);
-  console.log(`\nSummary saved to ${file}`);
+  if (profile) {
+    const report = buildProfileText(results);
+    console.log(`\n${report}`);
+    const files = saveProfileReports(results);
+    console.log(`\nProfile saved to ${files.txt}, ${files.json}, ${files.csv}`);
+  } else {
+    const summary = buildSummaryText(results);
+    console.log(`\n${summary}`);
+    const file = saveSummary(summary);
+    console.log(`\nSummary saved to ${file}`);
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -711,10 +970,18 @@ function printUsage(): void {
   for (const hop of RETURN_HOPS) {
     console.log(`  --${hop.id.padEnd(25)} ${hop.label}`);
   }
+  console.log(`\nModifiers (combine with any hop flag):`);
+  console.log(
+    `  --profile                Race swaps-api vs intent-journal status concurrently and write timing reports`,
+  );
   console.log(`\nEnv vars (all optional):`);
   console.log(`  PRIVATE_KEY              Wallet private key (required)`);
   console.log(`  INPUT_AMOUNT_HUMAN       Input amount (default: use full balance for native)`);
-  console.log(`  POLL_TIMEOUT_MS          SDK swap timeout (default: 120000)`);
+  console.log(
+    `  POLL_TIMEOUT_MS          SDK swap timeout (default: 120000; 300000 under --profile)`,
+  );
+  console.log(`  PROFILE_POLL_INTERVAL_MS Profile-mode poll interval (default: 1500)`);
+  console.log(`  JOURNAL_PROFILE_TIMEOUT_MS Profile-mode journal timeout (default: 300000)`);
   console.log(`  <CHAIN>_RPC_URL          RPC override per chain (e.g., BASE_RPC_URL)`);
 }
 
@@ -723,7 +990,11 @@ function printUsage(): void {
 // ----------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const flag = process.argv[2];
+  // `--profile` may appear anywhere; strip it so it composes with --all / single hops / --from.
+  const rawArgs = process.argv.slice(2);
+  const profile = rawArgs.includes('--profile');
+  const args = rawArgs.filter((a) => a !== '--profile');
+  const flag = args[0];
   const SPECIAL_FLAGS = new Set(['--balances', '--sweep']);
 
   if (!flag || (!FLAG_TO_HOP[flag] && !SPECIAL_FLAGS.has(flag))) {
@@ -751,13 +1022,13 @@ async function main(): Promise<void> {
 
   if (Array.isArray(target)) {
     // Optional `--from <chainKey>` (or `--from=<chainKey>`) to resume mid-sequence.
-    const rest = process.argv.slice(3);
+    const rest = args.slice(1);
     let startChain: string | undefined;
     const fromEq = rest.find((a) => a.startsWith('--from='));
     if (fromEq) startChain = fromEq.slice('--from='.length);
     const fromIdx = rest.indexOf('--from');
     if (fromIdx !== -1 && rest[fromIdx + 1]) startChain = rest[fromIdx + 1];
-    await executeAllHops(sodax, privateKey, startChain);
+    await executeAllHops(sodax, privateKey, startChain, profile);
   } else {
     // Check if src or dst chain is disabled
     const disabled = getDisabledChains();
@@ -771,9 +1042,9 @@ async function main(): Promise<void> {
     }
 
     console.log(`\n=== ${target.label} ===`);
-    let result: HopResult;
+    let result: HopProfile;
     try {
-      result = await executeHop(sodax, target, privateKey, 1);
+      result = await executeHop(sodax, target, privateKey, 1, profile);
     } catch (err: any) {
       console.error(`\nHop failed: ${err.message}`);
       result = {
@@ -786,10 +1057,17 @@ async function main(): Promise<void> {
         elapsedMs: 0,
       };
     }
-    const summary = buildSummaryText([result]);
-    console.log(`\n${summary}`);
-    const file = saveSummary(summary);
-    console.log(`\nSummary saved to ${file}`);
+    if (profile) {
+      const report = buildProfileText([result]);
+      console.log(`\n${report}`);
+      const files = saveProfileReports([result]);
+      console.log(`\nProfile saved to ${files.txt}, ${files.json}, ${files.csv}`);
+    } else {
+      const summary = buildSummaryText([result]);
+      console.log(`\n${summary}`);
+      const file = saveSummary(summary);
+      console.log(`\nSummary saved to ${file}`);
+    }
   }
 }
 

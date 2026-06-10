@@ -11,6 +11,7 @@
     "sonic-usdc-to-usdt": "tsx main.ts --sonic-usdc-to-sonic-usdt",
     "cancel": "tsx cancel.ts",
     "chain-hop": "tsx chain-hop.ts --all",
+    "chain-hop:profile": "tsx chain-hop.ts --all --profile",
     "balances": "tsx chain-hop.ts --balances",
     "sweep": "tsx chain-hop.ts --sweep",
     "hop-sonic-to-base": "tsx chain-hop.ts --sonic-to-base",

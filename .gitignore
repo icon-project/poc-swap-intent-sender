@@ -1,3 +1,6 @@
 node_modules
 .env
 chain-hop-summary-*.txt
+chain-hop-profile-*.txt
+chain-hop-profile-*.json
+chain-hop-profile-*.csv

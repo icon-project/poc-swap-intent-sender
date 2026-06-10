@@ -146,6 +146,23 @@ DISABLED_CHAINS='["optimism","redbelly"]'
 
 JSON array of chain keys to disable at runtime. Valid keys: `base`, `optimism`, `arbitrum`, `avalanche`, `bsc`, `polygon`, `ethereum`, `hyper`, `lightlink`, `redbelly`, `kaia`. `sonic` cannot be disabled (hub chain). When running `--all`, the hop sequence auto-rewires around disabled chains. Unset or empty = all chains enabled.
 
+### Timing profiling (`--profile`)
+
+A modifier flag that composes with any hop selection (`--all`, a single `--<hop>`, or `--from`). It runs the **exact same hop sequence** (same order, gas buffers, disabled-chain rewiring, inter-hop arrival waits) but profiles how long each status source takes to report the intent filled.
+
+```bash
+pnpm chain-hop:profile                       # --all --profile
+pnpm chain-hop -- --sonic-to-base --profile  # single hop, profiled
+```
+
+**What changes vs the default flow:** instead of polling the swaps-api to a terminal state *and then* cross-checking the journal (sequential), profile mode **races both concurrently from a shared anchor** — `tBroadcast`, the moment the create-intent tx is broadcast. Both pollers record per-phase transition timestamps relative to that anchor via the new `PollOptions.onPhase` hook (`helpers.ts`), so the two sources are measured from the same `t0`. Console lines are prefixed `[swap-api]` / `[journal]` (in-place rewriting disabled) so concurrent output stays readable.
+
+**Per hop it captures:** `createMs` (SDK build+broadcast), `confirmMs` (receipt wait), `submitMs` (POST /submit-tx), each swaps-api phase (`pending → relaying → relayed → posting_execution → executed`), each journal phase (`first-seen → filled`), and the headline `journalVsSwapDeltaMs = journalFilledMs − swapExecutedMs`.
+
+**Reports** (timestamped, written to cwd): `chain-hop-profile-<ts>.{txt,json,csv}` — human summary with aggregate min/avg/max per source, full machine-readable JSON, and a flat CSV (one row per hop).
+
+**Env vars** (profile-mode only): `PROFILE_POLL_INTERVAL_MS` (default `1500`), `JOURNAL_PROFILE_TIMEOUT_MS` (default `300000`); `POLL_TIMEOUT_MS` defaults to `300000` under `--profile`. The default (non-profile) flow is unchanged.
+
 ## TypeScript
 
 - Target: ES2022, Module: CommonJS, Strict mode enabled

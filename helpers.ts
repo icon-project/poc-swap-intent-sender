@@ -334,6 +334,22 @@ export async function submitIntent(payload: SubmitTxPayload, backendBaseUrl: str
 }
 
 /**
+ * Optional instrumentation for the status pollers. Lets a caller (a) anchor all phase-transition
+ * timestamps to a shared `t0` (so two concurrently-running pollers measure from the same origin),
+ * (b) receive a callback on every *new* phase, and (c) switch off in-place line rewriting so the
+ * output of two pollers running at once doesn't garble. All fields are optional; when absent the
+ * pollers behave exactly as before.
+ */
+export type PollOptions = {
+  /** Shared origin (ms epoch). Phase times reported to `onPhase` are `Date.now() - anchorMs`. */
+  anchorMs?: number;
+  /** Called once per new phase with the phase name and ms elapsed since `anchorMs`. */
+  onPhase?: (phase: string, atMs: number) => void;
+  /** Prefix each log line (e.g. `[swap-api]`) and disable in-place rewriting for concurrent use. */
+  logPrefix?: string;
+};
+
+/**
  * PRIMARY status poll — the swaps-api v2 `GET /submit-tx/status` route. This is the endpoint
  * under test: keyed exactly by `(txHash, srcChainKey)`, it reports the swaps-api pipeline's
  * own view (`pending → relaying → relayed → posting_execution → executed | failed`) and, on
@@ -347,10 +363,14 @@ export async function pollIntentStatus(
   intervalMs = 3000,
   timeoutMs = 120000,
   srcChainKey = 'sonic',
+  options?: PollOptions,
 ) {
   const url = `${backendBaseUrl}/submit-tx/status?txHash=${txHash}&srcChainKey=${srcChainKey}`;
-  console.log(`  GET ${url}`);
-  console.log(`  Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`);
+  const prefix = options?.logPrefix;
+  console.log(`${prefix ? `${prefix} ` : '  '}GET ${url}`);
+  console.log(
+    `${prefix ? `${prefix} ` : '  '}Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`,
+  );
 
   const TERMINAL_STATUSES = new Set(['executed', 'failed']);
   const deadline = Date.now() + timeoutMs;
@@ -358,6 +378,8 @@ export async function pollIntentStatus(
   let pollCount = 0;
   const pollStart = Date.now();
   let inPlace = false;
+  const anchorMs = options?.anchorMs ?? pollStart;
+  const mark = (phase: string) => options?.onPhase?.(phase, Date.now() - anchorMs);
 
   while (Date.now() < deadline) {
     pollCount++;
@@ -366,8 +388,13 @@ export async function pollIntentStatus(
     const body = (await response.json()) as { success: boolean; data?: Record<string, unknown> };
 
     if (!response.ok || !body.success || !body.data) {
-      overwriteLine(`  Poll #${pollCount} — HTTP ${response.status}, retrying... (${elapsed})`);
-      inPlace = true;
+      const line = `  Poll #${pollCount} — HTTP ${response.status}, retrying... (${elapsed})`;
+      if (prefix) {
+        console.log(`${prefix}${line}`);
+      } else {
+        overwriteLine(line);
+        inPlace = true;
+      }
       await sleep(intervalMs);
       continue;
     }
@@ -378,12 +405,18 @@ export async function pollIntentStatus(
       if (inPlace) process.stdout.write('\n');
       inPlace = false;
       console.log(
-        `  Poll #${pollCount} — status: ${lastStatus ? `${lastStatus} -> ` : ''}${status} (${elapsed})`,
+        `${prefix ? `${prefix} ` : '  '}Poll #${pollCount} — status: ${lastStatus ? `${lastStatus} -> ` : ''}${status} (${elapsed})`,
       );
+      if (status !== lastStatus) mark(status);
       lastStatus = status;
     } else {
-      overwriteLine(`  Poll #${pollCount} — status: ${status} (${elapsed})`);
-      inPlace = true;
+      const line = `  Poll #${pollCount} — status: ${status} (${elapsed})`;
+      if (prefix) {
+        console.log(`${prefix}${line}`);
+      } else {
+        overwriteLine(line);
+        inPlace = true;
+      }
     }
 
     if (TERMINAL_STATUSES.has(status)) {
@@ -450,17 +483,23 @@ export async function pollIntentJournal(
   lookup: IntentJournalLookup,
   intervalMs = 3000,
   timeoutMs = 180000,
+  options?: PollOptions,
 ) {
   const path = 'txHash' in lookup ? `intent/tx/${lookup.txHash}` : `intent/${lookup.intentHash}`;
   const url = `${apiBaseUrl}/${path}`;
-  console.log(`  GET ${url}`);
-  console.log(`  Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`);
+  const prefix = options?.logPrefix;
+  console.log(`${prefix ? `${prefix} ` : '  '}GET ${url}`);
+  console.log(
+    `${prefix ? `${prefix} ` : '  '}Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`,
+  );
 
   const deadline = Date.now() + timeoutMs;
   let pollCount = 0;
   let lastState = '';
   let inPlace = false;
   const pollStart = Date.now();
+  const anchorMs = options?.anchorMs ?? pollStart;
+  const mark = (phase: string) => options?.onPhase?.(phase, Date.now() - anchorMs);
 
   while (Date.now() < deadline) {
     pollCount++;
@@ -470,15 +509,25 @@ export async function pollIntentJournal(
     // 404 until the aggregator observes INTENT_CREATED on-chain and the transformator
     // writes the journal row — expected for the first few polls after submission.
     if (response.status === 404) {
-      overwriteLine(`  Poll #${pollCount} — not in journal yet (404), waiting... (${elapsed})`);
-      inPlace = true;
+      const line = `  Poll #${pollCount} — not in journal yet (404), waiting... (${elapsed})`;
+      if (prefix) {
+        console.log(`${prefix}${line}`);
+      } else {
+        overwriteLine(line);
+        inPlace = true;
+      }
       await sleep(intervalMs);
       continue;
     }
 
     if (!response.ok) {
-      overwriteLine(`  Poll #${pollCount} — HTTP ${response.status}, retrying... (${elapsed})`);
-      inPlace = true;
+      const line = `  Poll #${pollCount} — HTTP ${response.status}, retrying... (${elapsed})`;
+      if (prefix) {
+        console.log(`${prefix}${line}`);
+      } else {
+        overwriteLine(line);
+        inPlace = true;
+      }
       await sleep(intervalMs);
       continue;
     }
@@ -490,12 +539,19 @@ export async function pollIntentJournal(
       if (inPlace) process.stdout.write('\n');
       inPlace = false;
       console.log(
-        `  Poll #${pollCount} — journal: ${lastState ? `${lastState} -> ` : ''}${state} (${elapsed})`,
+        `${prefix ? `${prefix} ` : '  '}Poll #${pollCount} — journal: ${lastState ? `${lastState} -> ` : ''}${state} (${elapsed})`,
       );
+      // The first non-404 response (any state) means the journal row now exists on-chain.
+      if (lastState === '') mark('first-seen');
       lastState = state;
     } else {
-      overwriteLine(`  Poll #${pollCount} — journal: ${state} (${elapsed})`);
-      inPlace = true;
+      const line = `  Poll #${pollCount} — journal: ${state} (${elapsed})`;
+      if (prefix) {
+        console.log(`${prefix}${line}`);
+      } else {
+        overwriteLine(line);
+        inPlace = true;
+      }
     }
 
     // `open: false` means a terminal INTENT_FILLED / INTENT_CANCELLED has been observed.
@@ -505,12 +561,15 @@ export async function pollIntentJournal(
       const filled = events.find((e) => e.eventType === 'intent-filled');
       const cancelled = events.find((e) => e.eventType === 'intent-cancelled');
       if (filled) {
+        mark('filled');
         console.log(`  Intent FILLED`);
         console.log(`  fill txHash : ${filled.txHash}`);
       } else if (cancelled) {
+        mark('cancelled');
         console.log(`  Intent CANCELLED`);
         console.log(`  cancel txHash: ${cancelled.txHash}`);
       } else {
+        mark('closed');
         console.log(`  Intent closed (no fill/cancel event present)`);
       }
       if (journal.packetData) {

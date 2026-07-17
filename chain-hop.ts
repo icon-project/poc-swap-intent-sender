@@ -878,6 +878,7 @@ async function executeAllHops(
       const journalFilled = guardLookup
         ? await confirmIntentFilled(apiBaseUrl, guardLookup)
         : false;
+      const journalDesc = guardLookup ? 'not filled' : 'no lookup key';
       // Balance-delta signal: only usable if we have a pre-hop baseline AND this read succeeds.
       // Any RPC failure here just drops the balance signal (fall back to the journal) rather
       // than crashing the run.
@@ -902,9 +903,11 @@ async function executeAllHops(
         result.status = 'solved';
         advanced = true;
       } else {
+        // Note: this is a LACK of positive settlement evidence, not proof the hop didn't
+        // fill — the signals may simply be unavailable (no lookup key / no balance baseline).
         console.log(
-          `  Confirmed funds did NOT move (journal not filled; ${balanceDesc}). ` +
-            `Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
+          `  No settlement evidence (journal: ${journalDesc}; ${balanceDesc}) — ` +
+            `assuming funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
         );
       }
     }

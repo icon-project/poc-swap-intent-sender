@@ -550,7 +550,7 @@ function buildProfileText(results: HopProfile[]): string {
   const deltas = results.map((r) => r.journalVsSwapDeltaMs).filter((v): v is number => v != null);
 
   lines.push('AGGREGATE (across hops reporting a fill on that source)');
-  lines.push(`  swap-api time-to-executed: ${statRange(swapTimes)}  (n=${swapTimes.length})`);
+  lines.push(`  swap-api time-to-solved  : ${statRange(swapTimes)}  (n=${swapTimes.length})`);
   lines.push(`  journal  time-to-filled  : ${statRange(journalTimes)}  (n=${journalTimes.length})`);
   lines.push(`  journal - swap-api delta : ${statRange(deltas)}  (n=${deltas.length})`);
   const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);

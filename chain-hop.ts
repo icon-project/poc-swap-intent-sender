@@ -782,13 +782,22 @@ async function executeAllHops(
     // Snapshot the destination's native balance BEFORE the hop runs. If the hop reports a
     // failure/timeout, the guard below treats funds as "arrived" only when the balance rose
     // above this baseline — a real delta from THIS hop — so pre-existing dust / prefunded gas /
-    // a prior run can't be misread as a settled hop.
+    // a prior run can't be misread as a settled hop. Never abort the whole run on a transient
+    // RPC hiccup here: a failed read just leaves the baseline unknown (null), which disables the
+    // balance-delta signal for this hop and defers to the authoritative journal check.
     const dstChain = CHAIN_DEFS[dstKey];
-    const dstBalanceBefore = await getNativeBalance(
-      getRpcUrl(dstChain),
-      dstChain.viemChain,
-      walletAddress,
-    );
+    let dstBalanceBefore: bigint | null = null;
+    try {
+      dstBalanceBefore = await getNativeBalance(
+        getRpcUrl(dstChain),
+        dstChain.viemChain,
+        walletAddress,
+      );
+    } catch (err: any) {
+      console.log(
+        `  (pre-hop ${dstChain.name} balance read failed: ${err.message} — delta check disabled for this hop)`,
+      );
+    }
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`=== Hop ${hopNum}/${destinations.length}: ${hop.label} ===`);
@@ -840,13 +849,24 @@ async function executeAllHops(
       const journalFilled = result.intentHash
         ? await confirmIntentFilled(apiBaseUrl, { intentHash: result.intentHash })
         : false;
-      const dstBalanceNow = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-      const fundsArrived = dstBalanceNow > dstBalanceBefore;
+      // Balance-delta signal: only usable if we have a pre-hop baseline AND this read succeeds.
+      // Any RPC failure here just drops the balance signal (fall back to the journal) rather
+      // than crashing the run.
+      let fundsArrived = false;
+      let balanceDesc = 'balance signal unavailable';
+      try {
+        const dstBalanceNow = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+        fundsArrived = dstBalanceBefore !== null && dstBalanceNow > dstBalanceBefore;
+        balanceDesc =
+          dstBalanceBefore === null
+            ? `${dstChain.name} balance ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)} (no baseline)`
+            : `${dstChain.name} balance ${formatNativeBalance(dstBalanceBefore, dstChain.nativeSymbol)} -> ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}`;
+      } catch (err: any) {
+        console.log(`  (${dstChain.name} balance read failed: ${err.message})`);
+      }
 
       if (journalFilled || fundsArrived) {
-        const why = journalFilled
-          ? 'journal shows intent-filled'
-          : `${dstChain.name} balance rose ${formatNativeBalance(dstBalanceBefore, dstChain.nativeSymbol)} -> ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}`;
+        const why = journalFilled ? 'journal shows intent-filled' : `${dstChain.name} balance rose`;
         console.log(
           `  On-chain signals say the hop settled (${why}) — advancing to ${dstChain.name}.`,
         );
@@ -854,8 +874,7 @@ async function executeAllHops(
         advanced = true;
       } else {
         console.log(
-          `  Confirmed funds did NOT move (journal not filled; ${dstChain.name} balance ` +
-            `unchanged at ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}). ` +
+          `  Confirmed funds did NOT move (journal not filled; ${balanceDesc}). ` +
             `Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
         );
       }

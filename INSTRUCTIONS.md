@@ -182,7 +182,7 @@ default `https://api.sodax.com/v1/be`). It's independent of the swaps API's self
 Lifecycle: `404` (not yet observed) → `open: true` (created) → `open: false`
 (terminal `intent-filled` / `intent-cancelled`). `packetData` carries cross-chain
 delivery proof. Use it as a *soft* check — aggregator lag can make it trail the swaps
-API, so never let it fail an otherwise-executed run.
+API, so never let it fail an otherwise-successful run.
 
 ## 6. Cancelling an open intent
 

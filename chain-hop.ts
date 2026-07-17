@@ -378,7 +378,7 @@ async function executeHop(
 
     const elapsedMs = Date.now() - hopStart;
     console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
-    if (swapExecutedMs != null) console.log(`  swaps-api executed at: ${swapExecutedMs}ms`);
+    if (swapExecutedMs != null) console.log(`  swaps-api solved at: ${swapExecutedMs}ms`);
     if (journalFilledMs != null) console.log(`  journal filled at:     ${journalFilledMs}ms`);
     if (journalVsSwapDeltaMs != null)
       console.log(

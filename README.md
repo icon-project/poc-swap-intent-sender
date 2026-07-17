@@ -149,7 +149,7 @@ sequenceDiagram
     API->>Solver: relay and execute
     loop 4. poll until terminal
         U->>API: GET /submit-tx/status
-        API-->>U: pending, relaying, relayed, posted_execution, solved/failed
+        API-->>U: pending, relaying, relayed, posting_execution, posted_execution, solved/failed
     end
     Solver-->>Chain: fill delivered on destination
     U->>J: 5. GET /intent (journal cross-check)

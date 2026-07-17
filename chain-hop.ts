@@ -12,6 +12,7 @@ import {
   pollIntentStatus,
   pollIntentJournal,
   crossCheckIntentJournal,
+  confirmIntentFilled,
   buildSubmitPayload,
   overwriteLine,
   formatElapsed,
@@ -66,6 +67,7 @@ type HopResult = {
   label: string;
   txHash: string;
   intentId: string;
+  intentHash?: string; // hub intent hash — used to cross-check the journal on a failed/timed-out hop
   inputAmount: string;
   status: 'executed' | 'failed' | 'timeout' | 'skipped';
   elapsedMs: number;
@@ -79,9 +81,9 @@ type HopProfile = HopResult & {
   confirmMs?: number; // waitForTransactionReceipt on the source chain
   submitMs?: number; // POST /submit-tx round-trip
   // Phase name -> ms elapsed from the broadcast anchor (tBroadcast), per source.
-  swapPhases?: Record<string, number>; // pending/relaying/relayed/posting_execution/executed/failed
+  swapPhases?: Record<string, number>; // pending/relaying/relayed/posting_execution/posted_execution/solved/failed
   journalPhases?: Record<string, number>; // first-seen/filled/cancelled/closed
-  swapExecutedMs?: number | null; // time-to-executed reported by swaps-api
+  swapExecutedMs?: number | null; // time-to-solved (terminal success) reported by swaps-api
   journalFilledMs?: number | null; // time-to-filled reported by the intent journal
   journalVsSwapDeltaMs?: number | null; // journalFilledMs - swapExecutedMs
 };
@@ -306,7 +308,7 @@ async function executeHop(
   console.log(`  Confirmed in block ${receipt.blockNumber}`);
 
   // Step 3: Submit to the swaps v2 backend
-  const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/swaps';
+  const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://api.sodax.com/v1/swaps';
 
   const payload = buildSubmitPayload(
     txHash as `0x${string}`,
@@ -322,9 +324,9 @@ async function executeHop(
   const submitMs = Date.now() - tSubmitStart;
 
   // Cross-chain hops broadcast on the spoke chain, so the journal (keyed by the hub tx) is
-  // looked up by intentHash, not the spoke txHash. On-chain-derived → default to canary.
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  // looked up by intentHash, not the spoke txHash. On-chain-derived → any deployment works;
+  // default to the public gateway (`/v1/be` prefix).
+  const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
   const intentHash = sodax.swaps.getIntentHash(intent);
 
   if (profile) {
@@ -365,13 +367,14 @@ async function executeHop(
       }),
     ]);
 
-    const swapExecutedMs = swapPhases.executed ?? null;
+    // `solved` is the swaps-api terminal success phase (renamed from `executed` in a 2026 SODAX SDK rename).
+    const swapExecutedMs = swapPhases.solved ?? null;
     const journalFilledMs = journalPhases.filled ?? null;
     const journalVsSwapDeltaMs =
       swapExecutedMs != null && journalFilledMs != null ? journalFilledMs - swapExecutedMs : null;
 
     const hopStatus: HopResult['status'] =
-      swapPhases.executed != null ? 'executed' : swapPhases.failed != null ? 'failed' : 'timeout';
+      swapExecutedMs != null ? 'executed' : swapPhases.failed != null ? 'failed' : 'timeout';
 
     const elapsedMs = Date.now() - hopStart;
     console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
@@ -387,6 +390,7 @@ async function executeHop(
       label: hop.label,
       txHash: txHash as string,
       intentId: intent.intentId.toString(),
+      intentHash,
       inputAmount: inputAmountDisplay,
       status: hopStatus,
       elapsedMs,
@@ -417,7 +421,8 @@ async function executeHop(
       srcChain.chainKey,
     );
     const s = (result?.data as Record<string, unknown> | undefined)?.status;
-    hopStatus = s === 'executed' ? 'executed' : 'failed';
+    // `solved` is the swaps-api terminal success state (renamed from `executed` in a 2026 SODAX SDK rename).
+    hopStatus = s === 'solved' ? 'executed' : 'failed';
   } catch {
     hopStatus = 'timeout';
   }
@@ -434,6 +439,7 @@ async function executeHop(
     label: hop.label,
     txHash: txHash as string,
     intentId: intent.intentId.toString(),
+    intentHash,
     inputAmount: inputAmountDisplay,
     status: hopStatus,
     elapsedMs,
@@ -492,7 +498,8 @@ const SWAP_PHASE_ORDER = [
   'relaying',
   'relayed',
   'posting_execution',
-  'executed',
+  'posted_execution',
+  'solved', // terminal success (renamed from `executed` in a 2026 SODAX SDK rename)
   'failed',
 ];
 const JOURNAL_PHASE_ORDER = ['first-seen', 'filled', 'cancelled', 'closed'];
@@ -569,7 +576,8 @@ function buildProfileCsv(results: HopProfile[]): string {
     'swap_relaying',
     'swap_relayed',
     'swap_posting_execution',
-    'swap_executed',
+    'swap_posted_execution',
+    'swap_solved',
     'journal_first_seen',
     'journal_filled',
     'journalVsSwapDeltaMs',
@@ -590,7 +598,8 @@ function buildProfileCsv(results: HopProfile[]): string {
       cell(sp.relaying),
       cell(sp.relayed),
       cell(sp.posting_execution),
-      cell(sp.executed),
+      cell(sp.posted_execution),
+      cell(sp.solved),
       cell(jp['first-seen']),
       cell(jp.filled),
       cell(r.journalVsSwapDeltaMs),
@@ -801,8 +810,48 @@ async function executeAllHops(
         }
       }
     } else {
-      // Failure — funds are still on currentChain, do NOT update it
-      console.log(`  Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`);
+      // A reported failure/timeout is NOT proof the swap didn't fill: the status poll can give
+      // up before the fill lands (hub->spoke delivery lags), or misreport. Before assuming the
+      // funds stayed on the source chain and rewiring around this hop, verify against
+      // independent on-chain signals — did THIS intent settle in the journal, and/or did native
+      // funds actually arrive on the destination? If so, treat the hop as settled and advance.
+      const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
+      const dstChain = CHAIN_DEFS[dstKey];
+      const dstRpcUrl = getRpcUrl(dstChain);
+      const dstWallet = (await new ViemWalletProvider(
+        privateKey,
+        dstChain.viemChain,
+        dstRpcUrl,
+      ).getWalletAddress()) as Address;
+      const dstGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
+
+      console.log(
+        `  Reported "${result.status}" — cross-checking journal + ${dstChain.name} balance before rewiring...`,
+      );
+      // Journal is authoritative for this exact intent; balance is a corroborating fallback
+      // (mainly for the catch path, where we have no intentHash to look up).
+      const journalFilled = result.intentHash
+        ? await confirmIntentFilled(apiBaseUrl, { intentHash: result.intentHash })
+        : false;
+      const dstBalance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, dstWallet);
+      const fundsArrived = dstBalance > dstGasBuffer;
+
+      if (journalFilled || fundsArrived) {
+        const why = journalFilled
+          ? 'journal shows intent-filled'
+          : `${dstChain.name} balance ${formatNativeBalance(dstBalance, dstChain.nativeSymbol)} > gas buffer`;
+        console.log(
+          `  On-chain signals say the hop settled (${why}) — advancing to ${dstChain.name}.`,
+        );
+        result.status = 'executed';
+        currentChain = dstKey;
+      } else {
+        console.log(
+          `  Confirmed funds did NOT move (journal not filled; ${dstChain.name} balance ` +
+            `${formatNativeBalance(dstBalance, dstChain.nativeSymbol)} <= gas buffer). ` +
+            `Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
+        );
+      }
     }
 
     results.push(result);

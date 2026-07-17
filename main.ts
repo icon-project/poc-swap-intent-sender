@@ -53,7 +53,7 @@ function getTestCaseFromArgs(): TestCaseName {
 //   1. approve the intents contract to spend the input ERC20
 //   2. build + broadcast the create-intent tx via the SDK (returns { tx, intent, relayData })
 //   3. submit { txHash, srcChainKey, intent, relayData } to POST /v1/swaps/submit-tx
-//   4. PRIMARY: poll GET /v1/swaps/submit-tx/status until terminal (the endpoint under test)
+//   4. PRIMARY: poll GET /v1/swaps/submit-tx/status until terminal (solved/failed)
 //   5. cross-check the intent journal (apps/api) for independent on-chain confirmation
 //
 // Unlike the v1 PoC, the intent is built by the SDK (correct relay chain ids + relay data)
@@ -66,13 +66,11 @@ async function main() {
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
   const sonicDef = CHAIN_DEFS['sonic'];
   const rpcUrl = getRpcUrl(sonicDef);
-  const backendBaseUrl =
-    process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/swaps';
+  const backendBaseUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://api.sodax.com/v1/swaps';
 
-  // Status is read from the intent journal via apps/api (NOT swaps-api submit-tx/status).
-  // The journal is on-chain-derived, so any deployment works; default to canary (apiv1-1).
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  // Base URL for the soft intent-journal cross-check (apps/api, reached via the public
+  // `/v1/be` gateway prefix). The journal is on-chain-derived, so any deployment is equivalent.
+  const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
 
   const { account, walletClient, publicClient } = createClients(rpcUrl, privateKey);
   const walletProvider = new ViemWalletProvider(privateKey, sonicDef.viemChain, rpcUrl);
@@ -153,7 +151,7 @@ async function main() {
   );
   await submitIntent(payload, backendBaseUrl);
 
-  // Step 4: PRIMARY status — the swaps-api v2 submit-tx/status route (the endpoint under test).
+  // Step 4: PRIMARY status — the swaps-api v2 submit-tx/status route.
   console.log(`\n[4/5] Poll swaps-api submit-tx/status`);
   await pollIntentStatus(txHash as string, backendBaseUrl, pollIntervalMs, pollTimeoutMs, 'sonic');
 

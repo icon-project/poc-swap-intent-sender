@@ -25,8 +25,8 @@ relaying and execution for you.
 - An EVM wallet (private key) funded with the input token + gas on the **source** chain.
 - An `IEvmWalletProvider` the SDK can sign with. This PoC's `ViemWalletProvider`
   (`sdk-helpers.ts`) is a drop-in reference implementation over viem.
-- Base URL of the swaps API: **`https://canary-api.sodax.com/v1/swaps`**
-  (canary). Configurable via `BACKEND_SWAP_ENDPOINT`.
+- Base URL of the swaps API: **`https://api.sodax.com/v1/swaps`**
+  (public production). Configurable via `BACKEND_SWAP_ENDPOINT`.
 
 > The old v1 base path `/v1/bes/swaps` is retired (→ 404). Use `/v1/swaps`.
 
@@ -133,18 +133,26 @@ const url = `${BASE}/submit-tx/status?txHash=${txHash}&srcChainKey=${srcChainKey
 Pipeline lifecycle:
 
 ```
-pending → relaying → relayed → posting_execution → executed | failed
+pending → relaying → relayed → posting_execution → posted_execution → solved | failed
 ```
 
-**Success** (`status: "executed"`):
+> ⚠️ **`solved` is the terminal SUCCESS state — do not wait for `executed`.** `executed` was
+> renamed to `solved` in a 2026 SODAX SDK rename; they are the *same* state, not two steps. A
+> client polling for a `solved → executed` transition waits forever and then mistakes its own
+> timeout for a failure. The current union is
+> `pending | relaying | relayed | posting_execution | posted_execution | solved | failed`.
+> `executed` now appears **only** as the relay-*packet* status (`result.packetData.status`),
+> never as the submit-tx `status`.
+
+**Success** (`status: "solved"`):
 ```json
 { "success": true, "data": {
-  "txHash": "0x…", "srcChainKey": "sonic", "status": "executed",
+  "txHash": "0x…", "srcChainKey": "sonic", "status": "solved",
   "processingAttempts": 1,
   "result": {
     "dstIntentTxHash": "0x…",   // fill tx on the destination side
     "intent_hash": "0x…",
-    "packetData": { "status": "executed", "dst_tx_hash": "0x…", … }  // cross-chain only
+    "packetData": { "status": "executed", "dst_tx_hash": "0x…", … }  // cross-chain only; relay-packet status stays "executed"
   }
 } }
 ```
@@ -156,16 +164,16 @@ pending → relaying → relayed → posting_execution → executed | failed
 - `intentCancelled` — on-chain cancel flag
 - `abandonedAt` — set if the pipeline gave up
 
-Treat **`executed`** and **`failed`** as terminal; everything else means keep polling.
-A relay-level failure means nothing ever lands on-chain, so `submit-tx/status` is your
-primary (and sometimes only) signal — don't rely on the journal alone.
+Treat **`solved`** and **`failed`** as terminal; everything else (including
+`posted_execution`) means keep polling. A relay-level failure means nothing ever lands
+on-chain, so `submit-tx/status` is your primary (and sometimes only) signal — don't rely
+on the journal alone.
 
 ## 5. (Optional) Independent on-chain confirmation — intent journal
 
 For belt-and-suspenders confirmation that the fill actually landed on-chain, query the
-on-chain-derived intent journal (apps/api, default
-`https://apiv1-1.coolify.iconblockchain.xyz`). It's independent of the swaps API's
-self-report.
+on-chain-derived intent journal (apps/api, reached via the public `/v1/be` gateway prefix —
+default `https://api.sodax.com/v1/be`). It's independent of the swaps API's self-report.
 
 - **Sonic-source** (broadcast tx IS the hub intent tx): `GET /intent/tx/:txHash`
 - **Cross-chain** (broadcast tx is on a spoke): `GET /intent/:intentHash`, where
@@ -191,9 +199,9 @@ If an intent is still open (not yet filled), cancel it with the SDK:
 - [ ] After `createIntent`, wait for the **source-chain receipt** before `submit-tx`.
 - [ ] Respect the **10 req/min/IP** limit; back off on `429`.
 - [ ] Retry `submit-tx` freely — it's idempotent on `(txHash, srcChainKey)`.
-- [ ] Poll `submit-tx/status` until `executed`/`failed`; log `failedAtStep` /
-      `failureReason` / `userMessage` on failure.
-- [ ] For cross-chain, expect hub→spoke delivery to lag the `executed` status by
+- [ ] Poll `submit-tx/status` until `solved`/`failed` (NOT `executed` — see the ⚠️ above);
+      log `failedAtStep` / `failureReason` / `userMessage` on failure.
+- [ ] For cross-chain, expect hub→spoke delivery to lag the `solved` status by
       minutes; if your next action depends on funds arriving on the destination, poll
       the destination balance with a generous timeout (5–15 min) rather than assuming
       instant settlement.

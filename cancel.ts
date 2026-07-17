@@ -43,8 +43,7 @@ async function main() {
 
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
   const walletAddress = privateKeyToAccount(privateKey).address;
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
   const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS ?? '3000');
   const crossCheckTimeoutMs = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS ?? '90000');
 

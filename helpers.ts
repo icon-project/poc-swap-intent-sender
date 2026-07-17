@@ -352,10 +352,16 @@ export type PollOptions = {
 /**
  * PRIMARY status poll — the swaps-api v2 `GET /submit-tx/status` route. This is the endpoint
  * under test: keyed exactly by `(txHash, srcChainKey)`, it reports the swaps-api pipeline's
- * own view (`pending → relaying → relayed → posting_execution → executed | failed`) and, on
- * failure, *why* (`failedAtStep` / `failureReason` / `userMessage`), plus the on-chain
- * `intentCancelled` flag. The intent journal (see `crossCheckIntentJournal`) can't surface
- * pipeline-step failures — notably a relay failure means nothing ever lands in the journal.
+ * own view (`pending → relaying → relayed → posting_execution → posted_execution → solved |
+ * failed`) and, on failure, *why* (`failedAtStep` / `failureReason` / `userMessage`), plus the
+ * on-chain `intentCancelled` flag. The intent journal (see `crossCheckIntentJournal`) can't
+ * surface pipeline-step failures — notably a relay failure means nothing ever lands in the
+ * journal.
+ *
+ * Terminal states: `solved` = success, `failed` = failure. `solved` was named `executed`
+ * before a 2026 SODAX SDK rename; they are the SAME terminal state, not two steps in a
+ * pipeline — there is no `solved → executed` transition to wait for. `executed` now exists
+ * only as the relay-*packet* status (`result.packetData.status`), never as a submit-tx status.
  */
 export async function pollIntentStatus(
   txHash: string,
@@ -372,7 +378,9 @@ export async function pollIntentStatus(
     `${prefix ? `${prefix} ` : '  '}Poll interval: ${intervalMs}ms, timeout: ${timeoutMs}ms`,
   );
 
-  const TERMINAL_STATUSES = new Set(['executed', 'failed']);
+  // `solved` = terminal success, `failed` = terminal failure. `posted_execution` is a
+  // non-terminal intermediate → the loop keeps polling.
+  const TERMINAL_STATUSES = new Set(['solved', 'failed']);
   const deadline = Date.now() + timeoutMs;
   let lastStatus = '';
   let pollCount = 0;
@@ -420,8 +428,8 @@ export async function pollIntentStatus(
     }
 
     if (TERMINAL_STATUSES.has(status)) {
-      if (status === 'executed') {
-        console.log(`  Swap executed successfully`);
+      if (status === 'solved') {
+        console.log(`  Swap solved (success)`);
         const result = body.data.result as Record<string, unknown> | undefined;
         if (result) {
           console.log(`  dstIntentTxHash: ${result.dstIntentTxHash ?? ''}`);
@@ -587,6 +595,40 @@ export async function pollIntentJournal(
   throw new Error(
     `Polling timed out after ${timeoutMs}ms — last journal state: ${lastState || 'not found'}`,
   );
+}
+
+/**
+ * One-shot (short-poll) journal check: did THIS intent reach a terminal FILLED state on-chain?
+ * Unlike `crossCheckIntentJournal` (which only logs), this returns a boolean so callers can
+ * branch on it — used defensively before the chain-hop rewire logic assumes a failed/timed-out
+ * hop left funds on the source chain. Never throws: any error / 404 / not-yet-terminal / timeout
+ * yields `false`, so the caller can fall back to a balance probe.
+ */
+export async function confirmIntentFilled(
+  apiBaseUrl: string,
+  lookup: IntentJournalLookup,
+  timeoutMs = 30000,
+  intervalMs = 5000,
+): Promise<boolean> {
+  const path = 'txHash' in lookup ? `intent/tx/${lookup.txHash}` : `intent/${lookup.intentHash}`;
+  const url = `${apiBaseUrl}/${path}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        const journal = (await response.json()) as IntentJournalResponse;
+        // `open: false` = terminal; treat only an explicit `intent-filled` event as settled.
+        if (!journal.open) {
+          return (journal.events ?? []).some((e) => e.eventType === 'intent-filled');
+        }
+      }
+    } catch {
+      // Network/parse hiccup — retry until the deadline.
+    }
+    await sleep(intervalMs);
+  }
+  return false;
 }
 
 /**

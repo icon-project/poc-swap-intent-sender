@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sodax-builders": {
+      "type": "sse",
+      "url": "https://builders.sodax.com/sse"
+    }
+  }
+}

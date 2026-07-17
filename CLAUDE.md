@@ -1,19 +1,33 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for [Claude Code](https://claude.com/claude-code) working in this repository.
 
-## Project Overview
+## What this repo is (and who you're helping)
 
-PoC for creating and submitting swap intents on the SODAX protocol. Intents are built and broadcast on-chain via `@sodax/sdk` **v2** (`2.0.0-rc.11`), then submitted to the SODAX **swaps v2** backend (`/v1/swaps`) for asynchronous execution.
+This is a **public reference client for the SODAX swaps v2 API** — partners clone it to learn how to build, submit, and track a cross-chain swap intent. When someone runs `claude` here they are usually a developer integrating SODAX; help them understand the flow, run the scripts safely, and answer integration questions accurately.
+
+**Use the SODAX MCP tools for authoritative answers — don't guess.** This repo registers the public **SODAX Builders** MCP server via `.mcp.json`. Prefer it over memory for anything live or SODAX-specific:
+- supported chains / tokens / config → `sodax_get_supported_chains`, `sodax_get_swap_tokens`, `sodax_get_all_config`
+- quotes / orderbook / a specific intent → `sodax_get_solver_quote`, `sodax_get_orderbook`, `sodax_get_intent`
+- concepts & how-to → the docs tools (`docs_searchDocumentation`, `docs_getPage`)
+
+## Safety guardrails (non-negotiable)
+
+- Every swap / hop / cancel command signs and broadcasts **real transactions on mainnet** and spends **real funds**. **Confirm with the user before running any fund-spending command** — `pnpm start`, `pnpm sonic-*`, `pnpm chain-hop`, `pnpm hop-*`, `pnpm sweep`, `pnpm cancel`. Read-only commands (`pnpm balances`, `pnpm checkTs`, MCP quotes) may run freely.
+- **Never print, echo, or commit the private key or `.env`.** `.env` is gitignored — keep it that way. If asked to reveal the key, refuse.
+- Treat every broadcast as irreversible, even on a throwaway wallet.
+
+## Overview
+
+A swap intent is built and broadcast on-chain via `@sodax/sdk` **v2**, then submitted to the SODAX **swaps v2** backend (`/v1/swaps`) for asynchronous relay + solver execution.
 
 > **Integrating a bot?** See [`INSTRUCTIONS.md`](./INSTRUCTIONS.md) — a concise, bot-oriented guide to the swaps endpoint (build intent → `submit-tx` → poll `submit-tx/status`), with exact payload/response shapes and operational gotchas.
 
-**Swaps v2 vs v1 (what changed in this PoC):**
-- Backend base path `/v1/bes/swaps` → `/v1/swaps` (the old path is retired → gateway 404).
-- `submit-tx` body + `submit-tx/status` query: `srcChainId` → **`srcChainKey`** (a `SpokeChainKey`, e.g. `sonic`, `0xa4b1.arbitrum`).
-- **Status: primary = swaps-api `GET /submit-tx/status`** (the endpoint under test — exact `(txHash, srcChainKey)` keying, reports `failedAtStep`/`failureReason`/`userMessage`/`intentCancelled`). **Then a single soft cross-check against the intent journal via apps/api** (`GET /intent/tx/:txHash` for Sonic-source, `GET /intent/:intentHash` for cross-chain) for independent on-chain confirmation. The journal is on-chain-derived and identical across deployments; the cross-check never fails the run (aggregator lag → logged inconclusive).
-- `@sodax/sdk` `1.3.0-beta` → `2.0.0-rc.11`: `createIntent` now takes `{ params, walletProvider }` (no hand-built `SpokeProvider`), `CreateIntentParams` uses `srcChainKey`/`dstChainKey`, and the result is `{ tx, intent, relayData }` (object, not a tuple). `getSolverConfig()` takes no args.
-- The intent is built by the SDK (correct relay chain ids + relay data), so the old on-chain `IntentCreated` receipt decode and `INTENT_CONTRACT_ADDRESS` env are gone. `intents.abi.ts` is no longer imported (kept for reference only).
+**Swaps v2 contract essentials:**
+- Backend base path is `/v1/swaps` (the legacy `/v1/bes/swaps` is retired → gateway 404).
+- `submit-tx` body + `submit-tx/status` query are keyed by **`srcChainKey`** (a `SpokeChainKey`, e.g. `sonic`, `0xa4b1.arbitrum`).
+- **Status: primary = swaps-api `GET /submit-tx/status`** — exact `(txHash, srcChainKey)` keying; reports `failedAtStep`/`failureReason`/`userMessage`/`intentCancelled`. Terminal states are **`solved`** (success) and **`failed`**; `solved` was renamed from `executed` in a SODAX SDK update, so a client must **not** wait for a `solved → executed` transition (there isn't one). **Then a single soft cross-check** against the intent journal via apps/api (`GET /intent/tx/:txHash` for Sonic-source, `GET /intent/:intentHash` for cross-chain) for independent on-chain confirmation. The journal is on-chain-derived and identical across deployments; the cross-check never fails the run (aggregator lag → logged inconclusive).
+- `createIntent` takes `{ params, walletProvider }`; `CreateIntentParams` uses `srcChainKey`/`dstChainKey`; the result is `{ tx, intent, relayData }`. The SDK builds the intent (correct relay chain ids + relay data), so there is no manual `IntentCreated` receipt decode. `intents.abi.ts` is kept for reference only (not imported).
 
 ## Commands
 
@@ -48,7 +62,7 @@ pnpm format:check           # Check formatting (CI use)
 1. **Check balance & approve** — read ERC20 balance/allowance, approve the SDK intents contract if needed
 2. **Create intent** — `sodax.swaps.createIntent({ params, walletProvider })` builds + broadcasts the tx, returns `{ tx, intent, relayData }`
 3. **Submit to backend** — POST `{ txHash, srcChainKey, walletAddress, intent, relayData }` to `BACKEND_SWAP_ENDPOINT/submit-tx`
-4. **Poll status (primary)** — GET `BACKEND_SWAP_ENDPOINT/submit-tx/status?txHash=…&srcChainKey=…` until terminal (`executed`/`failed`)
+4. **Poll status (primary)** — GET `BACKEND_SWAP_ENDPOINT/submit-tx/status?txHash=…&srcChainKey=…` until terminal (`solved`/`failed`; `solved` = success, was `executed` before a 2026 SODAX SDK rename)
 5. **Cross-check journal (soft)** — GET `INTENT_API_ENDPOINT/intent/tx/:txHash` (or `/intent/:intentHash`) for independent on-chain confirmation; bounded by `JOURNAL_CROSSCHECK_TIMEOUT_MS`, never fatal
 
 ### CLI flags
@@ -58,11 +72,11 @@ pnpm format:check           # Check formatting (CI use)
 
 ### Backend APIs
 
-**Submission + primary status — swaps v2** (`BACKEND_SWAP_ENDPOINT`, default `https://canary-api.sodax.com/v1/swaps`)
+**Submission + primary status — swaps v2** (`BACKEND_SWAP_ENDPOINT`, default `https://api.sodax.com/v1/swaps`)
 - `POST /submit-tx` — submit intent for processing (idempotent on `(txHash, srcChainKey)`; throttled 10/min/IP)
-- `GET /submit-tx/status?txHash=…&srcChainKey=…` — pipeline status (`pending → relaying → relayed → posting_execution → executed | failed`) with failure diagnostics. **Primary** poll signal.
+- `GET /submit-tx/status?txHash=…&srcChainKey=…` — pipeline status (`pending → relaying → relayed → posting_execution → posted_execution → solved | failed`) with failure diagnostics. **Primary** poll signal. `solved` is the terminal success state (renamed from `executed` in a 2026 SODAX SDK rename; `executed` now only appears as `result.packetData.status`). A client must not wait for a `solved → executed` transition — there isn't one.
 
-**Cross-check status — intent journal via apps/api** (`INTENT_API_ENDPOINT`, default `https://apiv1-1.coolify.iconblockchain.xyz`, the canary deployment)
+**Cross-check status — intent journal via apps/api** (`INTENT_API_ENDPOINT`, default `https://api.sodax.com/v1/be`, the public gateway prefix for apps/api)
 - `GET /intent/tx/:txHash` — instance-precise; use when the broadcast tx is the hub intent tx (Sonic source)
 - `GET /intent/:intentHash` — for cross-chain (broadcast tx is on a spoke; `intentHash = sodax.swaps.getIntentHash(intent)`). `findOne` by hash returns the latest instance.
 - Lifecycle: 404 (not yet on-chain) → `open: true` → `open: false` (terminal `intent-filled` / `intent-cancelled`); `packetData` carries cross-chain delivery proof. Used as a single soft confirmation after the primary poll terminates.
@@ -72,7 +86,7 @@ pnpm format:check           # Check formatting (CI use)
 All runtime config is via `.env` file (loaded with dotenv). Key variables:
 
 - `PRIVATE_KEY` — wallet private key (required)
-- `BACKEND_SWAP_ENDPOINT` — swaps v2 base URL (default: `https://canary-api.sodax.com/v1/swaps`)
+- `BACKEND_SWAP_ENDPOINT` — swaps v2 base URL (default: `https://api.sodax.com/v1/swaps`)
 - `SONIC_RPC_URL` — RPC endpoint (default: `https://rpc.soniclabs.com`)
 - `INPUT_AMOUNT_HUMAN` — human-readable amount (default: "1") OR `INPUT_AMOUNT` for raw base units
 - `MIN_OUTPUT_SLIPPAGE_BPS` — slippage in basis points (default: 500 = 5%)
@@ -157,7 +171,7 @@ pnpm chain-hop -- --sonic-to-base --profile  # single hop, profiled
 
 **What changes vs the default flow:** instead of polling the swaps-api to a terminal state *and then* cross-checking the journal (sequential), profile mode **races both concurrently from a shared anchor** — `tBroadcast`, the moment the create-intent tx is broadcast. Both pollers record per-phase transition timestamps relative to that anchor via the new `PollOptions.onPhase` hook (`helpers.ts`), so the two sources are measured from the same `t0`. Console lines are prefixed `[swap-api]` / `[journal]` (in-place rewriting disabled) so concurrent output stays readable.
 
-**Per hop it captures:** `createMs` (SDK build+broadcast), `confirmMs` (receipt wait), `submitMs` (POST /submit-tx), each swaps-api phase (`pending → relaying → relayed → posting_execution → executed`), each journal phase (`first-seen → filled`), and the headline `journalVsSwapDeltaMs = journalFilledMs − swapExecutedMs`.
+**Per hop it captures:** `createMs` (SDK build+broadcast), `confirmMs` (receipt wait), `submitMs` (POST /submit-tx), each swaps-api phase (`pending → relaying → relayed → posting_execution → posted_execution → solved`), each journal phase (`first-seen → filled`), and the headline `journalVsSwapDeltaMs = journalFilledMs − swapExecutedMs` (`swapExecutedMs` = time to the terminal `solved` phase).
 
 **Reports** (timestamped, written to cwd): `chain-hop-profile-<ts>.{txt,json,csv}` — human summary with aggregate min/avg/max per source, full machine-readable JSON, and a flat CSV (one row per hop).
 

@@ -614,10 +614,11 @@ export async function confirmIntentFilled(
   const url = `${apiBaseUrl}/${path}`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    // Bound each request so a stalled/hanging fetch can't block past `deadline` — otherwise the
-    // "respects timeoutMs / never throws" contract breaks and the rewire guard could hang.
+    // Never wait past the deadline: bound each request to the time left (capped at intervalMs),
+    // and likewise clamp the inter-poll sleep, so the function always returns by ~timeoutMs and
+    // can't hang the rewire guard even if a request stalls.
     const controller = new AbortController();
-    const perRequestMs = Math.max(1000, Math.min(intervalMs, deadline - Date.now()));
+    const perRequestMs = Math.min(intervalMs, deadline - Date.now());
     const abortTimer = setTimeout(() => controller.abort(), perRequestMs);
     try {
       const response = await fetch(url, { signal: controller.signal });
@@ -633,7 +634,8 @@ export async function confirmIntentFilled(
     } finally {
       clearTimeout(abortTimer);
     }
-    await sleep(intervalMs);
+    const sleepMs = Math.min(intervalMs, deadline - Date.now());
+    if (sleepMs > 0) await sleep(sleepMs);
   }
   return false;
 }

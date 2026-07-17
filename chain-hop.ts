@@ -13,6 +13,7 @@ import {
   pollIntentJournal,
   crossCheckIntentJournal,
   confirmIntentFilled,
+  type IntentJournalLookup,
   buildSubmitPayload,
   overwriteLine,
   formatElapsed,
@@ -323,11 +324,15 @@ async function executeHop(
   await submitIntent(payload, backendUrl);
   const submitMs = Date.now() - tSubmitStart;
 
-  // Cross-chain hops broadcast on the spoke chain, so the journal (keyed by the hub tx) is
-  // looked up by intentHash, not the spoke txHash. On-chain-derived → any deployment works;
-  // default to the public gateway (`/v1/be` prefix).
+  // Journal base URL — on-chain-derived, so any deployment works; default to the public
+  // gateway (`/v1/be` prefix).
   const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
   const intentHash = sodax.swaps.getIntentHash(intent);
+  // Instance-precise journal lookup: a Sonic-source hop broadcasts the hub intent tx directly,
+  // so it's keyed by txHash; a cross-chain hop broadcasts on a spoke, so the journal (keyed by
+  // the hub tx) must be looked up by intentHash. (See IntentJournalLookup in helpers.)
+  const journalLookup: IntentJournalLookup =
+    srcChain.chainKey === 'sonic' ? { txHash: txHash as string } : { intentHash };
 
   if (profile) {
     // PROFILE MODE: race the two status sources concurrently from the broadcast anchor so we
@@ -358,7 +363,7 @@ async function executeHop(
           },
         },
       ),
-      pollIntentJournal(apiBaseUrl, { intentHash }, profileInterval, journalTimeout, {
+      pollIntentJournal(apiBaseUrl, journalLookup, profileInterval, journalTimeout, {
         anchorMs: tBroadcast,
         logPrefix: '[journal] ',
         onPhase: (p, at) => {
@@ -429,7 +434,7 @@ async function executeHop(
 
   // Independent on-chain confirmation via the intent journal (soft, never fatal).
   const crossCheckTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
-  await crossCheckIntentJournal(apiBaseUrl, { intentHash }, pollInterval, crossCheckTimeout);
+  await crossCheckIntentJournal(apiBaseUrl, journalLookup, pollInterval, crossCheckTimeout);
 
   const elapsedMs = Date.now() - hopStart;
   console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
@@ -861,8 +866,17 @@ async function executeAllHops(
       // DELTA vs the pre-hop snapshot (funds increased during this hop) — an absolute
       // "> gas buffer" test would treat pre-existing dust / prefunded gas / prior-run funds
       // as this hop's arrival and wrongly advance.
-      const journalFilled = result.intentHash
-        ? await confirmIntentFilled(apiBaseUrl, { intentHash: result.intentHash })
+      // Sonic-source hops broadcast the hub intent tx directly (instance-precise lookup by
+      // txHash); cross-chain (spoke-source) hops use intentHash. `currentChain` is still the
+      // source here (only advanced below), so it identifies the hop's source.
+      const guardLookup: IntentJournalLookup | null =
+        currentChain === 'sonic' && result.txHash
+          ? { txHash: result.txHash }
+          : result.intentHash
+            ? { intentHash: result.intentHash }
+            : null;
+      const journalFilled = guardLookup
+        ? await confirmIntentFilled(apiBaseUrl, guardLookup)
         : false;
       // Balance-delta signal: only usable if we have a pre-hop baseline AND this read succeeds.
       // Any RPC failure here just drops the balance signal (fall back to the journal) rather

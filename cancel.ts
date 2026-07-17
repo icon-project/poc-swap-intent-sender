@@ -43,13 +43,12 @@ async function main() {
 
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
   const walletAddress = privateKeyToAccount(privateKey).address;
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
   const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS ?? '3000');
   const crossCheckTimeoutMs = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS ?? '90000');
 
   const startMs = Date.now();
-  console.log(`\nSODAX Cancel Intent (v2)`);
+  console.log(`\nSODAX Cancel Intent`);
   console.log(`Wallet  : ${walletAddress}`);
   console.log(`Intent  : ${intentId}`);
   console.log(`Journal : ${apiBaseUrl}`);

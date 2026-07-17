@@ -12,6 +12,8 @@ import {
   pollIntentStatus,
   pollIntentJournal,
   crossCheckIntentJournal,
+  confirmIntentFilled,
+  type IntentJournalLookup,
   buildSubmitPayload,
   overwriteLine,
   formatElapsed,
@@ -66,8 +68,9 @@ type HopResult = {
   label: string;
   txHash: string;
   intentId: string;
+  intentHash?: string; // hub intent hash — used to cross-check the journal on a failed/timed-out hop
   inputAmount: string;
-  status: 'executed' | 'failed' | 'timeout' | 'skipped';
+  status: 'solved' | 'failed' | 'timeout' | 'skipped';
   elapsedMs: number;
 };
 
@@ -79,9 +82,9 @@ type HopProfile = HopResult & {
   confirmMs?: number; // waitForTransactionReceipt on the source chain
   submitMs?: number; // POST /submit-tx round-trip
   // Phase name -> ms elapsed from the broadcast anchor (tBroadcast), per source.
-  swapPhases?: Record<string, number>; // pending/relaying/relayed/posting_execution/executed/failed
+  swapPhases?: Record<string, number>; // pending/relaying/relayed/posting_execution/posted_execution/solved/failed
   journalPhases?: Record<string, number>; // first-seen/filled/cancelled/closed
-  swapExecutedMs?: number | null; // time-to-executed reported by swaps-api
+  swapExecutedMs?: number | null; // time-to-solved (terminal success) reported by swaps-api
   journalFilledMs?: number | null; // time-to-filled reported by the intent journal
   journalVsSwapDeltaMs?: number | null; // journalFilledMs - swapExecutedMs
 };
@@ -305,8 +308,8 @@ async function executeHop(
   const confirmMs = Date.now() - tConfirmStart;
   console.log(`  Confirmed in block ${receipt.blockNumber}`);
 
-  // Step 3: Submit to the swaps v2 backend
-  const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://canary-api.sodax.com/v1/swaps';
+  // Step 3: Submit to the swaps backend
+  const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://api.sodax.com/v1/swaps';
 
   const payload = buildSubmitPayload(
     txHash as `0x${string}`,
@@ -316,16 +319,20 @@ async function executeHop(
     relayData.payload,
   );
 
-  console.log(`\n  Submitting to swaps v2...`);
+  console.log(`\n  Submitting to swaps...`);
   const tSubmitStart = Date.now();
   await submitIntent(payload, backendUrl);
   const submitMs = Date.now() - tSubmitStart;
 
-  // Cross-chain hops broadcast on the spoke chain, so the journal (keyed by the hub tx) is
-  // looked up by intentHash, not the spoke txHash. On-chain-derived → default to canary.
-  const apiBaseUrl =
-    process.env.INTENT_API_ENDPOINT || 'https://apiv1-1.coolify.iconblockchain.xyz';
+  // Journal base URL — on-chain-derived, so any deployment works; default to the public
+  // gateway (`/v1/be` prefix).
+  const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
   const intentHash = sodax.swaps.getIntentHash(intent);
+  // Instance-precise journal lookup: a Sonic-source hop broadcasts the hub intent tx directly,
+  // so it's keyed by txHash; a cross-chain hop broadcasts on a spoke, so the journal (keyed by
+  // the hub tx) must be looked up by intentHash. (See IntentJournalLookup in helpers.)
+  const journalLookup: IntentJournalLookup =
+    srcChain.chainKey === 'sonic' ? { txHash: txHash as string } : { intentHash };
 
   if (profile) {
     // PROFILE MODE: race the two status sources concurrently from the broadcast anchor so we
@@ -356,7 +363,7 @@ async function executeHop(
           },
         },
       ),
-      pollIntentJournal(apiBaseUrl, { intentHash }, profileInterval, journalTimeout, {
+      pollIntentJournal(apiBaseUrl, journalLookup, profileInterval, journalTimeout, {
         anchorMs: tBroadcast,
         logPrefix: '[journal] ',
         onPhase: (p, at) => {
@@ -365,17 +372,18 @@ async function executeHop(
       }),
     ]);
 
-    const swapExecutedMs = swapPhases.executed ?? null;
+    // `solved` is the swaps-api terminal success phase (renamed from `executed` in a 2026 SODAX SDK rename).
+    const swapExecutedMs = swapPhases.solved ?? null;
     const journalFilledMs = journalPhases.filled ?? null;
     const journalVsSwapDeltaMs =
       swapExecutedMs != null && journalFilledMs != null ? journalFilledMs - swapExecutedMs : null;
 
     const hopStatus: HopResult['status'] =
-      swapPhases.executed != null ? 'executed' : swapPhases.failed != null ? 'failed' : 'timeout';
+      swapExecutedMs != null ? 'solved' : swapPhases.failed != null ? 'failed' : 'timeout';
 
     const elapsedMs = Date.now() - hopStart;
     console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
-    if (swapExecutedMs != null) console.log(`  swaps-api executed at: ${swapExecutedMs}ms`);
+    if (swapExecutedMs != null) console.log(`  swaps-api solved at: ${swapExecutedMs}ms`);
     if (journalFilledMs != null) console.log(`  journal filled at:     ${journalFilledMs}ms`);
     if (journalVsSwapDeltaMs != null)
       console.log(
@@ -387,6 +395,7 @@ async function executeHop(
       label: hop.label,
       txHash: txHash as string,
       intentId: intent.intentId.toString(),
+      intentHash,
       inputAmount: inputAmountDisplay,
       status: hopStatus,
       elapsedMs,
@@ -401,13 +410,13 @@ async function executeHop(
     };
   }
 
-  // DEFAULT MODE: PRIMARY status — poll the swaps-api v2 submit-tx/status route (keyed by the
+  // DEFAULT MODE: PRIMARY status — poll the swaps-api submit-tx/status route (keyed by the
   // source-chain txHash + srcChainKey), then a single soft journal cross-check.
   console.log(`\n  Polling swaps-api submit-tx/status...`);
   const pollInterval = Number(process.env.POLL_INTERVAL_MS || '3000');
   const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
 
-  let hopStatus: 'executed' | 'failed' | 'timeout' = 'timeout';
+  let hopStatus: 'solved' | 'failed' | 'timeout' = 'timeout';
   try {
     const result = await pollIntentStatus(
       txHash as string,
@@ -417,14 +426,15 @@ async function executeHop(
       srcChain.chainKey,
     );
     const s = (result?.data as Record<string, unknown> | undefined)?.status;
-    hopStatus = s === 'executed' ? 'executed' : 'failed';
+    // `solved` is the swaps-api terminal success state (renamed from `executed` in a 2026 SODAX SDK rename).
+    hopStatus = s === 'solved' ? 'solved' : 'failed';
   } catch {
     hopStatus = 'timeout';
   }
 
   // Independent on-chain confirmation via the intent journal (soft, never fatal).
   const crossCheckTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
-  await crossCheckIntentJournal(apiBaseUrl, { intentHash }, pollInterval, crossCheckTimeout);
+  await crossCheckIntentJournal(apiBaseUrl, journalLookup, pollInterval, crossCheckTimeout);
 
   const elapsedMs = Date.now() - hopStart;
   console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
@@ -434,6 +444,7 @@ async function executeHop(
     label: hop.label,
     txHash: txHash as string,
     intentId: intent.intentId.toString(),
+    intentHash,
     inputAmount: inputAmountDisplay,
     status: hopStatus,
     elapsedMs,
@@ -466,11 +477,11 @@ function buildSummaryText(results: HopResult[]): string {
   }
 
   const totalMs = results.reduce((sum, r) => sum + r.elapsedMs, 0);
-  const executed = results.filter((r) => r.status === 'executed').length;
+  const solved = results.filter((r) => r.status === 'solved').length;
   const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
   const skipped = results.filter((r) => r.status === 'skipped').length;
   lines.push(`Total elapsed: ${formatMs(totalMs)}`);
-  lines.push(`Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`);
+  lines.push(`Solved: ${solved} | Failed: ${failed} | Skipped: ${skipped}`);
   lines.push(sep);
 
   return lines.join('\n');
@@ -492,7 +503,8 @@ const SWAP_PHASE_ORDER = [
   'relaying',
   'relayed',
   'posting_execution',
-  'executed',
+  'posted_execution',
+  'solved', // terminal success (renamed from `executed` in a 2026 SODAX SDK rename)
   'failed',
 ];
 const JOURNAL_PHASE_ORDER = ['first-seen', 'filled', 'cancelled', 'closed'];
@@ -543,15 +555,15 @@ function buildProfileText(results: HopProfile[]): string {
   const deltas = results.map((r) => r.journalVsSwapDeltaMs).filter((v): v is number => v != null);
 
   lines.push('AGGREGATE (across hops reporting a fill on that source)');
-  lines.push(`  swap-api time-to-executed: ${statRange(swapTimes)}  (n=${swapTimes.length})`);
+  lines.push(`  swap-api time-to-solved  : ${statRange(swapTimes)}  (n=${swapTimes.length})`);
   lines.push(`  journal  time-to-filled  : ${statRange(journalTimes)}  (n=${journalTimes.length})`);
   lines.push(`  journal - swap-api delta : ${statRange(deltas)}  (n=${deltas.length})`);
   const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);
-  const executed = results.filter((r) => r.status === 'executed').length;
+  const solved = results.filter((r) => r.status === 'solved').length;
   const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
   const skipped = results.filter((r) => r.status === 'skipped').length;
   lines.push(
-    `  Total wall-clock: ${formatMs(totalMs)} | Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`,
+    `  Total wall-clock: ${formatMs(totalMs)} | Solved: ${solved} | Failed: ${failed} | Skipped: ${skipped}`,
   );
   lines.push(sep);
   return lines.join('\n');
@@ -569,7 +581,8 @@ function buildProfileCsv(results: HopProfile[]): string {
     'swap_relaying',
     'swap_relayed',
     'swap_posting_execution',
-    'swap_executed',
+    'swap_posted_execution',
+    'swap_solved',
     'journal_first_seen',
     'journal_filled',
     'journalVsSwapDeltaMs',
@@ -590,7 +603,8 @@ function buildProfileCsv(results: HopProfile[]): string {
       cell(sp.relaying),
       cell(sp.relayed),
       cell(sp.posting_execution),
-      cell(sp.executed),
+      cell(sp.posted_execution),
+      cell(sp.solved),
       cell(jp['first-seen']),
       cell(jp.filled),
       cell(r.journalVsSwapDeltaMs),
@@ -657,6 +671,77 @@ function buildHop(srcKey: string, dstKey: string): HopDef {
 // ALL HOPS EXECUTION
 // ----------------------------------------------------------------------------
 
+/**
+ * Wait until the destination chain holds enough native token to fund the NEXT hop (i.e. more
+ * than its gas buffer). Runs whenever we advance `currentChain` — after a normal success AND
+ * after the failure-path guard treats a hop as settled (notably journal-only fills, where the
+ * hub->spoke native delivery can lag the fill by minutes). Uses an absolute `> gasBuffer`
+ * threshold on purpose: here we only care whether there's enough to proceed, not which hop
+ * delivered it. Never throws — a timeout logs and proceeds (the next hop re-checks its balance).
+ */
+async function waitForArrival(dstKey: string, walletAddress: Address): Promise<void> {
+  const dstChain = CHAIN_DEFS[dstKey];
+  const dstRpcUrl = getRpcUrl(dstChain);
+  const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
+  let balanceBefore: bigint;
+  try {
+    balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+  } catch (err: any) {
+    console.log(
+      `\n  (could not read ${dstChain.name} balance: ${err.message}) — proceeding; the next hop re-checks its own balance.`,
+    );
+    return;
+  }
+  console.log(
+    `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
+      `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
+  );
+
+  if (balanceBefore > nextGasBuffer) {
+    console.log(`  Already funded above gas buffer, proceeding to next hop.`);
+    return;
+  }
+  console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
+
+  const pollInterval = 10_000;
+  // Hub->spoke native delivery can lag well past the swap-status timeout (some legs take
+  // >5 min), so give arrival its own, more generous budget.
+  const pollTimeout = Number(process.env.ARRIVAL_TIMEOUT_MS || '900000');
+  const deadline = Date.now() + pollTimeout;
+
+  let balanceInPlace = false;
+  let funded = false;
+  while (Date.now() < deadline) {
+    await sleep(pollInterval);
+    let balance: bigint;
+    try {
+      balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+    } catch (err: any) {
+      overwriteLine(`  ${dstChain.name} balance read error (${err.message}); retrying...`);
+      balanceInPlace = true;
+      continue;
+    }
+    if (balance > nextGasBuffer) {
+      if (balanceInPlace) process.stdout.write('\n');
+      console.log(
+        `  Balance now ${formatNativeBalance(balance, dstChain.nativeSymbol)}, proceeding to next hop.`,
+      );
+      funded = true;
+      break;
+    }
+    overwriteLine(
+      `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
+    );
+    balanceInPlace = true;
+  }
+  if (!funded) {
+    if (balanceInPlace) process.stdout.write('\n');
+    console.log(
+      `  Timed out waiting for funds on ${dstChain.name}; proceeding anyway (next hop re-checks).`,
+    );
+  }
+}
+
 async function executeAllHops(
   sodax: Sodax,
   privateKey: Hex,
@@ -700,12 +785,21 @@ async function executeAllHops(
 
   const results: HopProfile[] = [];
 
+  // Same EVM address on every chain — derive once for balance reads across the loop.
+  const walletAddress = (await new ViemWalletProvider(
+    privateKey,
+    CHAIN_DEFS['sonic'].viemChain,
+    getRpcUrl(CHAIN_DEFS['sonic']),
+  ).getWalletAddress()) as Address;
+
   for (let i = 0; i < destinations.length; i++) {
     const dstKey = destinations[i];
 
     // Build hop dynamically from wherever funds actually are
     const hop = buildHop(currentChain, dstKey);
     const hopNum = i + 1;
+
+    const dstChain = CHAIN_DEFS[dstKey];
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`=== Hop ${hopNum}/${destinations.length}: ${hop.label} ===`);
@@ -736,73 +830,65 @@ async function executeAllHops(
       };
     }
 
-    const succeeded = result.status === 'executed';
+    let advanced = result.status === 'solved';
 
-    if (succeeded) {
-      // Update current chain to destination — funds moved
-      currentChain = dstKey;
+    if (!advanced) {
+      // A reported failure/timeout is NOT proof the swap didn't fill: the status poll can give
+      // up before the fill lands, or misreport. Before assuming the funds stayed on the source
+      // chain and rewiring around this hop, cross-check the intent journal, which is
+      // authoritative for THIS exact intent. Give it the same aggregator-lag budget the rest
+      // of the repo uses for journal checks (JOURNAL_CROSSCHECK_TIMEOUT_MS, default 90s) —
+      // a shorter window would wrongly conclude "not filled" during normal journal lag and
+      // rewire around an already-settled hop.
+      //
+      // The destination native balance is deliberately NOT used as an advance signal: at this
+      // checkpoint hub->spoke delivery almost always still lags (so it can't corroborate), and
+      // a bare balance rise isn't specific to this intent. The journal alone decides.
+      const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
+      const journalTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
+      // Sonic-source hops broadcast the hub intent tx directly (instance-precise lookup by
+      // txHash); cross-chain (spoke-source) hops use intentHash. `currentChain` is still the
+      // source here (only advanced below), so it identifies the hop's source.
+      const guardLookup: IntentJournalLookup | null =
+        currentChain === 'sonic' && result.txHash
+          ? { txHash: result.txHash }
+          : result.intentHash
+            ? { intentHash: result.intentHash }
+            : null;
 
-      // Wait for funds to arrive on the destination chain before next hop
-      if (i < destinations.length - 1) {
-        const dstChain = CHAIN_DEFS[dstKey];
-        const dstRpcUrl = getRpcUrl(dstChain);
-        const walletAddress = (await new ViemWalletProvider(
-          privateKey,
-          dstChain.viemChain,
-          dstRpcUrl,
-        ).getWalletAddress()) as Address;
+      console.log(
+        `  Reported "${result.status}" — cross-checking the intent journal before rewiring...`,
+      );
+      const journalFilled = guardLookup
+        ? await confirmIntentFilled(apiBaseUrl, guardLookup, journalTimeout)
+        : false;
 
-        // The next hop spends from this chain, so it needs more than the gas buffer.
-        // Wait on that absolute threshold rather than a strict increase: the journal
-        // cross-check above can take long enough that funds already landed before this
-        // snapshot, which made the old "balance must increase" check time out on success.
-        const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
-        const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+      if (journalFilled) {
         console.log(
-          `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
-            `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
+          `  Journal shows intent-filled — the hop settled; advancing to ${dstChain.name}.`,
         );
-
-        if (balanceBefore > nextGasBuffer) {
-          console.log(`  Already funded above gas buffer, proceeding to next hop.`);
-        } else {
-          console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
-
-          const pollInterval = 10_000;
-          // Hub->spoke native delivery can lag well past the swap-status timeout
-          // (some legs take >5 min), so give arrival its own, more generous budget.
-          const pollTimeout = Number(process.env.ARRIVAL_TIMEOUT_MS || '900000');
-          const deadline = Date.now() + pollTimeout;
-
-          let balanceInPlace = false;
-          let funded = false;
-          while (Date.now() < deadline) {
-            await sleep(pollInterval);
-            const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-            if (balance > nextGasBuffer) {
-              if (balanceInPlace) process.stdout.write('\n');
-              console.log(
-                `  Balance now ${formatNativeBalance(balance, dstChain.nativeSymbol)}, proceeding to next hop.`,
-              );
-              funded = true;
-              break;
-            }
-            overwriteLine(
-              `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
-            );
-            balanceInPlace = true;
-          }
-          if (!funded) {
-            if (balanceInPlace) process.stdout.write('\n');
-            console.log(
-              `  Timed out waiting for funds on ${dstChain.name}; proceeding anyway (next hop re-checks).`,
-            );
-          }
-        }
+        result.status = 'solved';
+        advanced = true;
+      } else {
+        // A LACK of positive evidence, not proof the hop didn't fill — the journal may simply
+        // not have caught up, or there was no lookup key (hop threw before broadcasting).
+        const why = guardLookup ? 'journal not filled within timeout' : 'no journal lookup key';
+        console.log(
+          `  No settlement evidence (${why}) — assuming funds remain on ` +
+            `${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
+        );
       }
-    } else {
-      // Failure — funds are still on currentChain, do NOT update it
-      console.log(`  Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`);
+    }
+
+    if (advanced) {
+      // Funds moved to the destination — make it the source for the next hop, then wait for the
+      // native balance to actually arrive. This runs for BOTH a normal success and a
+      // guard-confirmed settle: on a journal-only fill the hub->spoke delivery may still be in
+      // flight, and without this the next hop would start from an unfunded chain.
+      currentChain = dstKey;
+      if (i < destinations.length - 1) {
+        await waitForArrival(dstKey, walletAddress);
+      }
     }
 
     results.push(result);

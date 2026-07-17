@@ -666,6 +666,62 @@ function buildHop(srcKey: string, dstKey: string): HopDef {
 // ALL HOPS EXECUTION
 // ----------------------------------------------------------------------------
 
+/**
+ * Wait until the destination chain holds enough native token to fund the NEXT hop (i.e. more
+ * than its gas buffer). Runs whenever we advance `currentChain` — after a normal success AND
+ * after the failure-path guard treats a hop as settled (notably journal-only fills, where the
+ * hub->spoke native delivery can lag the fill by minutes). Uses an absolute `> gasBuffer`
+ * threshold on purpose: here we only care whether there's enough to proceed, not which hop
+ * delivered it. Never throws — a timeout logs and proceeds (the next hop re-checks its balance).
+ */
+async function waitForArrival(dstKey: string, walletAddress: Address): Promise<void> {
+  const dstChain = CHAIN_DEFS[dstKey];
+  const dstRpcUrl = getRpcUrl(dstChain);
+  const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
+  const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+  console.log(
+    `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
+      `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
+  );
+
+  if (balanceBefore > nextGasBuffer) {
+    console.log(`  Already funded above gas buffer, proceeding to next hop.`);
+    return;
+  }
+  console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
+
+  const pollInterval = 10_000;
+  // Hub->spoke native delivery can lag well past the swap-status timeout (some legs take
+  // >5 min), so give arrival its own, more generous budget.
+  const pollTimeout = Number(process.env.ARRIVAL_TIMEOUT_MS || '900000');
+  const deadline = Date.now() + pollTimeout;
+
+  let balanceInPlace = false;
+  let funded = false;
+  while (Date.now() < deadline) {
+    await sleep(pollInterval);
+    const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+    if (balance > nextGasBuffer) {
+      if (balanceInPlace) process.stdout.write('\n');
+      console.log(
+        `  Balance now ${formatNativeBalance(balance, dstChain.nativeSymbol)}, proceeding to next hop.`,
+      );
+      funded = true;
+      break;
+    }
+    overwriteLine(
+      `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
+    );
+    balanceInPlace = true;
+  }
+  if (!funded) {
+    if (balanceInPlace) process.stdout.write('\n');
+    console.log(
+      `  Timed out waiting for funds on ${dstChain.name}; proceeding anyway (next hop re-checks).`,
+    );
+  }
+}
+
 async function executeAllHops(
   sodax: Sodax,
   privateKey: Hex,
@@ -709,12 +765,30 @@ async function executeAllHops(
 
   const results: HopProfile[] = [];
 
+  // Same EVM address on every chain — derive once for balance reads across the loop.
+  const walletAddress = (await new ViemWalletProvider(
+    privateKey,
+    CHAIN_DEFS['sonic'].viemChain,
+    getRpcUrl(CHAIN_DEFS['sonic']),
+  ).getWalletAddress()) as Address;
+
   for (let i = 0; i < destinations.length; i++) {
     const dstKey = destinations[i];
 
     // Build hop dynamically from wherever funds actually are
     const hop = buildHop(currentChain, dstKey);
     const hopNum = i + 1;
+
+    // Snapshot the destination's native balance BEFORE the hop runs. If the hop reports a
+    // failure/timeout, the guard below treats funds as "arrived" only when the balance rose
+    // above this baseline — a real delta from THIS hop — so pre-existing dust / prefunded gas /
+    // a prior run can't be misread as a settled hop.
+    const dstChain = CHAIN_DEFS[dstKey];
+    const dstBalanceBefore = await getNativeBalance(
+      getRpcUrl(dstChain),
+      dstChain.viemChain,
+      walletAddress,
+    );
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`=== Hop ${hopNum}/${destinations.length}: ${hop.label} ===`);
@@ -745,112 +819,56 @@ async function executeAllHops(
       };
     }
 
-    const succeeded = result.status === 'executed';
+    let advanced = result.status === 'executed';
 
-    if (succeeded) {
-      // Update current chain to destination — funds moved
-      currentChain = dstKey;
-
-      // Wait for funds to arrive on the destination chain before next hop
-      if (i < destinations.length - 1) {
-        const dstChain = CHAIN_DEFS[dstKey];
-        const dstRpcUrl = getRpcUrl(dstChain);
-        const walletAddress = (await new ViemWalletProvider(
-          privateKey,
-          dstChain.viemChain,
-          dstRpcUrl,
-        ).getWalletAddress()) as Address;
-
-        // The next hop spends from this chain, so it needs more than the gas buffer.
-        // Wait on that absolute threshold rather than a strict increase: the journal
-        // cross-check above can take long enough that funds already landed before this
-        // snapshot, which made the old "balance must increase" check time out on success.
-        const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
-        const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-        console.log(
-          `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
-            `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
-        );
-
-        if (balanceBefore > nextGasBuffer) {
-          console.log(`  Already funded above gas buffer, proceeding to next hop.`);
-        } else {
-          console.log(`  Waiting for ${dstChain.nativeSymbol} to arrive on ${dstChain.name}...`);
-
-          const pollInterval = 10_000;
-          // Hub->spoke native delivery can lag well past the swap-status timeout
-          // (some legs take >5 min), so give arrival its own, more generous budget.
-          const pollTimeout = Number(process.env.ARRIVAL_TIMEOUT_MS || '900000');
-          const deadline = Date.now() + pollTimeout;
-
-          let balanceInPlace = false;
-          let funded = false;
-          while (Date.now() < deadline) {
-            await sleep(pollInterval);
-            const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-            if (balance > nextGasBuffer) {
-              if (balanceInPlace) process.stdout.write('\n');
-              console.log(
-                `  Balance now ${formatNativeBalance(balance, dstChain.nativeSymbol)}, proceeding to next hop.`,
-              );
-              funded = true;
-              break;
-            }
-            overwriteLine(
-              `  ${dstChain.name} balance: ${formatNativeBalance(balance, dstChain.nativeSymbol)} (waiting...)`,
-            );
-            balanceInPlace = true;
-          }
-          if (!funded) {
-            if (balanceInPlace) process.stdout.write('\n');
-            console.log(
-              `  Timed out waiting for funds on ${dstChain.name}; proceeding anyway (next hop re-checks).`,
-            );
-          }
-        }
-      }
-    } else {
+    if (!advanced) {
       // A reported failure/timeout is NOT proof the swap didn't fill: the status poll can give
       // up before the fill lands (hub->spoke delivery lags), or misreport. Before assuming the
       // funds stayed on the source chain and rewiring around this hop, verify against
       // independent on-chain signals — did THIS intent settle in the journal, and/or did native
       // funds actually arrive on the destination? If so, treat the hop as settled and advance.
       const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
-      const dstChain = CHAIN_DEFS[dstKey];
       const dstRpcUrl = getRpcUrl(dstChain);
-      const dstWallet = (await new ViemWalletProvider(
-        privateKey,
-        dstChain.viemChain,
-        dstRpcUrl,
-      ).getWalletAddress()) as Address;
-      const dstGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
 
       console.log(
         `  Reported "${result.status}" — cross-checking journal + ${dstChain.name} balance before rewiring...`,
       );
-      // Journal is authoritative for this exact intent; balance is a corroborating fallback
-      // (mainly for the catch path, where we have no intentHash to look up).
+      // Journal is authoritative for THIS exact intent. The balance signal must be a real
+      // DELTA vs the pre-hop snapshot (funds increased during this hop) — an absolute
+      // "> gas buffer" test would treat pre-existing dust / prefunded gas / prior-run funds
+      // as this hop's arrival and wrongly advance.
       const journalFilled = result.intentHash
         ? await confirmIntentFilled(apiBaseUrl, { intentHash: result.intentHash })
         : false;
-      const dstBalance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, dstWallet);
-      const fundsArrived = dstBalance > dstGasBuffer;
+      const dstBalanceNow = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+      const fundsArrived = dstBalanceNow > dstBalanceBefore;
 
       if (journalFilled || fundsArrived) {
         const why = journalFilled
           ? 'journal shows intent-filled'
-          : `${dstChain.name} balance ${formatNativeBalance(dstBalance, dstChain.nativeSymbol)} > gas buffer`;
+          : `${dstChain.name} balance rose ${formatNativeBalance(dstBalanceBefore, dstChain.nativeSymbol)} -> ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}`;
         console.log(
           `  On-chain signals say the hop settled (${why}) — advancing to ${dstChain.name}.`,
         );
         result.status = 'executed';
-        currentChain = dstKey;
+        advanced = true;
       } else {
         console.log(
           `  Confirmed funds did NOT move (journal not filled; ${dstChain.name} balance ` +
-            `${formatNativeBalance(dstBalance, dstChain.nativeSymbol)} <= gas buffer). ` +
+            `unchanged at ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}). ` +
             `Funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
         );
+      }
+    }
+
+    if (advanced) {
+      // Funds moved to the destination — make it the source for the next hop, then wait for the
+      // native balance to actually arrive. This runs for BOTH a normal success and a
+      // guard-confirmed settle: on a journal-only fill the hub->spoke delivery may still be in
+      // flight, and without this the next hop would start from an unfunded chain.
+      currentChain = dstKey;
+      if (i < destinations.length - 1) {
+        await waitForArrival(dstKey, walletAddress);
       }
     }
 

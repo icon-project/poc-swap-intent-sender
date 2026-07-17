@@ -134,27 +134,29 @@ Resolves the `intentId` to its full `Intent` struct via the journal (`GET {INTEN
 
 ```mermaid
 sequenceDiagram
-    actor U as "Your app (this repo)"
-    participant SDK as "@sodax/sdk"
-    participant Chain as "Source chain"
-    participant API as "swaps v2 API (api.sodax.com/v1/swaps)"
-    participant Solver as "Relay + Solver"
-    participant J as "Intent journal (api.sodax.com/v1/be)"
+    participant U as Your app
+    participant SDK as SODAX SDK
+    participant Chain as Source chain
+    participant API as Swaps v2 API
+    participant Solver as Relay and Solver
+    participant J as Intent journal
 
     U->>Chain: 1. approve ERC20 (if needed)
-    U->>SDK: 2. createIntent({ params, walletProvider })
+    U->>SDK: 2. createIntent(params, walletProvider)
     SDK->>Chain: broadcast create-intent tx
-    Chain-->>SDK: txHash + { intent, relayData }
-    U->>API: 3. POST /submit-tx { txHash, srcChainKey, intent, relayData }
-    API->>Solver: relay + execute
+    Chain-->>SDK: txHash, intent, relayData
+    U->>API: 3. POST /submit-tx
+    API->>Solver: relay and execute
     loop 4. poll until terminal
-        U->>API: GET /submit-tx/status?txHash&srcChainKey
-        API-->>U: pending → relaying → relayed → posted_execution → solved | failed
+        U->>API: GET /submit-tx/status
+        API-->>U: pending, relaying, relayed, posted_execution, solved/failed
     end
     Solver-->>Chain: fill delivered on destination
-    U->>J: 5. GET /intent/tx/:txHash (or /intent/:intentHash)
-    J-->>U: open:false, intent-filled (independent on-chain confirmation)
+    U->>J: 5. GET /intent (journal cross-check)
+    J-->>U: open=false, intent-filled
 ```
+
+_Endpoints — Swaps v2 API: `https://api.sodax.com/v1/swaps` · Intent journal: `https://api.sodax.com/v1/be` (public gateway prefix)._
 
 **Terminal status:** `solved` = success, `failed` = failure. (`solved` was renamed from `executed` in a 2026 SODAX SDK rename; a client must not wait for a `solved → executed` transition — there isn't one. `executed` now appears only as `result.packetData.status`.)
 

@@ -69,7 +69,7 @@ type HopResult = {
   intentId: string;
   intentHash?: string; // hub intent hash — used to cross-check the journal on a failed/timed-out hop
   inputAmount: string;
-  status: 'executed' | 'failed' | 'timeout' | 'skipped';
+  status: 'solved' | 'failed' | 'timeout' | 'skipped';
   elapsedMs: number;
 };
 
@@ -374,7 +374,7 @@ async function executeHop(
       swapExecutedMs != null && journalFilledMs != null ? journalFilledMs - swapExecutedMs : null;
 
     const hopStatus: HopResult['status'] =
-      swapExecutedMs != null ? 'executed' : swapPhases.failed != null ? 'failed' : 'timeout';
+      swapExecutedMs != null ? 'solved' : swapPhases.failed != null ? 'failed' : 'timeout';
 
     const elapsedMs = Date.now() - hopStart;
     console.log(`  Elapsed: ${formatElapsed(hopStart)}`);
@@ -411,7 +411,7 @@ async function executeHop(
   const pollInterval = Number(process.env.POLL_INTERVAL_MS || '3000');
   const pollTimeout = Number(process.env.POLL_TIMEOUT_MS || '120000');
 
-  let hopStatus: 'executed' | 'failed' | 'timeout' = 'timeout';
+  let hopStatus: 'solved' | 'failed' | 'timeout' = 'timeout';
   try {
     const result = await pollIntentStatus(
       txHash as string,
@@ -422,7 +422,7 @@ async function executeHop(
     );
     const s = (result?.data as Record<string, unknown> | undefined)?.status;
     // `solved` is the swaps-api terminal success state (renamed from `executed` in a 2026 SODAX SDK rename).
-    hopStatus = s === 'solved' ? 'executed' : 'failed';
+    hopStatus = s === 'solved' ? 'solved' : 'failed';
   } catch {
     hopStatus = 'timeout';
   }
@@ -472,11 +472,11 @@ function buildSummaryText(results: HopResult[]): string {
   }
 
   const totalMs = results.reduce((sum, r) => sum + r.elapsedMs, 0);
-  const executed = results.filter((r) => r.status === 'executed').length;
+  const solved = results.filter((r) => r.status === 'solved').length;
   const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
   const skipped = results.filter((r) => r.status === 'skipped').length;
   lines.push(`Total elapsed: ${formatMs(totalMs)}`);
-  lines.push(`Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`);
+  lines.push(`Solved: ${solved} | Failed: ${failed} | Skipped: ${skipped}`);
   lines.push(sep);
 
   return lines.join('\n');
@@ -554,11 +554,11 @@ function buildProfileText(results: HopProfile[]): string {
   lines.push(`  journal  time-to-filled  : ${statRange(journalTimes)}  (n=${journalTimes.length})`);
   lines.push(`  journal - swap-api delta : ${statRange(deltas)}  (n=${deltas.length})`);
   const totalMs = results.reduce((s, r) => s + r.elapsedMs, 0);
-  const executed = results.filter((r) => r.status === 'executed').length;
+  const solved = results.filter((r) => r.status === 'solved').length;
   const failed = results.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
   const skipped = results.filter((r) => r.status === 'skipped').length;
   lines.push(
-    `  Total wall-clock: ${formatMs(totalMs)} | Executed: ${executed} | Failed: ${failed} | Skipped: ${skipped}`,
+    `  Total wall-clock: ${formatMs(totalMs)} | Solved: ${solved} | Failed: ${failed} | Skipped: ${skipped}`,
   );
   lines.push(sep);
   return lines.join('\n');
@@ -678,7 +678,15 @@ async function waitForArrival(dstKey: string, walletAddress: Address): Promise<v
   const dstChain = CHAIN_DEFS[dstKey];
   const dstRpcUrl = getRpcUrl(dstChain);
   const nextGasBuffer = GAS_BUFFERS[dstKey] ?? parseUnits('0.001', 18);
-  const balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+  let balanceBefore: bigint;
+  try {
+    balanceBefore = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+  } catch (err: any) {
+    console.log(
+      `\n  (could not read ${dstChain.name} balance: ${err.message}) — proceeding; the next hop re-checks its own balance.`,
+    );
+    return;
+  }
   console.log(
     `\n  ${dstChain.name} balance: ${formatNativeBalance(balanceBefore, dstChain.nativeSymbol)} ` +
       `(need > ${formatNativeBalance(nextGasBuffer, dstChain.nativeSymbol)} to hop)`,
@@ -700,7 +708,14 @@ async function waitForArrival(dstKey: string, walletAddress: Address): Promise<v
   let funded = false;
   while (Date.now() < deadline) {
     await sleep(pollInterval);
-    const balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+    let balance: bigint;
+    try {
+      balance = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
+    } catch (err: any) {
+      overwriteLine(`  ${dstChain.name} balance read error (${err.message}); retrying...`);
+      balanceInPlace = true;
+      continue;
+    }
     if (balance > nextGasBuffer) {
       if (balanceInPlace) process.stdout.write('\n');
       console.log(
@@ -828,7 +843,7 @@ async function executeAllHops(
       };
     }
 
-    let advanced = result.status === 'executed';
+    let advanced = result.status === 'solved';
 
     if (!advanced) {
       // A reported failure/timeout is NOT proof the swap didn't fill: the status poll can give
@@ -870,7 +885,7 @@ async function executeAllHops(
         console.log(
           `  On-chain signals say the hop settled (${why}) — advancing to ${dstChain.name}.`,
         );
-        result.status = 'executed';
+        result.status = 'solved';
         advanced = true;
       } else {
         console.log(

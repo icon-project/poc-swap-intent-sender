@@ -48,7 +48,7 @@ async function main() {
   const crossCheckTimeoutMs = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS ?? '90000');
 
   const startMs = Date.now();
-  console.log(`\nSODAX Cancel Intent (v2)`);
+  console.log(`\nSODAX Cancel Intent`);
   console.log(`Wallet  : ${walletAddress}`);
   console.log(`Intent  : ${intentId}`);
   console.log(`Journal : ${apiBaseUrl}`);

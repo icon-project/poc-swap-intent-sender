@@ -4,7 +4,7 @@ Guidance for [Claude Code](https://claude.com/claude-code) working in this repos
 
 ## What this repo is (and who you're helping)
 
-This is a **public reference client for the SODAX swaps v2 API** — partners clone it to learn how to build, submit, and track a cross-chain swap intent. When someone runs `claude` here they are usually a developer integrating SODAX; help them understand the flow, run the scripts safely, and answer integration questions accurately.
+This is a **public reference client for the SODAX swaps API** — partners clone it to learn how to build, submit, and track a cross-chain swap intent. When someone runs `claude` here they are usually a developer integrating SODAX; help them understand the flow, run the scripts safely, and answer integration questions accurately.
 
 **Use the SODAX MCP tools for authoritative answers — don't guess.** This repo registers the public **SODAX Builders** MCP server via `.mcp.json`. Prefer it over memory for anything live or SODAX-specific:
 - supported chains / tokens / config → `sodax_get_supported_chains`, `sodax_get_swap_tokens`, `sodax_get_all_config`
@@ -19,11 +19,11 @@ This is a **public reference client for the SODAX swaps v2 API** — partners cl
 
 ## Overview
 
-A swap intent is built and broadcast on-chain via `@sodax/sdk` **v2**, then submitted to the SODAX **swaps v2** backend (`/v1/swaps`) for asynchronous relay + solver execution.
+A swap intent is built and broadcast on-chain via `@sodax/sdk` **v2**, then submitted to the SODAX **swaps** backend (`/v1/swaps`) for asynchronous relay + solver execution.
 
 > **Integrating a bot?** See [`INSTRUCTIONS.md`](./INSTRUCTIONS.md) — a concise, bot-oriented guide to the swaps endpoint (build intent → `submit-tx` → poll `submit-tx/status`), with exact payload/response shapes and operational gotchas.
 
-**Swaps v2 contract essentials:**
+**Swaps contract essentials:**
 - Backend base path is `/v1/swaps` (the legacy `/v1/bes/swaps` is retired → gateway 404).
 - `submit-tx` body + `submit-tx/status` query are keyed by **`srcChainKey`** (a `SpokeChainKey`, e.g. `sonic`, `0xa4b1.arbitrum`).
 - **Status: primary = swaps-api `GET /submit-tx/status`** — exact `(txHash, srcChainKey)` keying; reports `failedAtStep`/`failureReason`/`userMessage`/`intentCancelled`. Terminal states are **`solved`** (success) and **`failed`**; `solved` was renamed from `executed` in a SODAX SDK update, so a client must **not** wait for a `solved → executed` transition (there isn't one). **Then a single soft cross-check** against the intent journal via apps/api (`GET /intent/tx/:txHash` for Sonic-source, `GET /intent/:intentHash` for cross-chain) for independent on-chain confirmation. The journal is on-chain-derived and identical across deployments; the cross-check never fails the run (aggregator lag → logged inconclusive).
@@ -44,7 +44,7 @@ pnpm format:check           # Check formatting (CI use)
 
 ## Architecture
 
-**Flow:** Approve ERC20 -> SDK builds + broadcasts create-intent tx -> Submit to swaps v2 backend -> Poll status
+**Flow:** Approve ERC20 -> SDK builds + broadcasts create-intent tx -> Submit to swaps backend -> Poll status
 
 ### Key files
 
@@ -54,7 +54,7 @@ pnpm format:check           # Check formatting (CI use)
 | `cancel.ts` | `pnpm cancel <intentId>` — resolves the id via the journal, then `sodax.swaps.cancelIntent` |
 | `helpers.ts` | Env helpers, ERC20/approval utils, `buildSubmitPayload`, submit/poll, `findIntentById`/`journalIntentToSdkIntent`, types/constants |
 | `sdk-helpers.ts` | `ViemWalletProvider` (`IEvmWalletProvider`), chain registry, balance helpers, disabled-chain logic |
-| `chain-hop.ts` | Cross-chain hop demo (also targets swaps v2) |
+| `chain-hop.ts` | Cross-chain hop demo (also targets swaps) |
 | `intents.abi.ts` | Full ABI for the Intent contract (auto-generated). No longer imported — kept for reference. |
 
 ### Pipeline steps (in main.ts)
@@ -72,7 +72,7 @@ pnpm format:check           # Check formatting (CI use)
 
 ### Backend APIs
 
-**Submission + primary status — swaps v2** (`BACKEND_SWAP_ENDPOINT`, default `https://api.sodax.com/v1/swaps`)
+**Submission + primary status — swaps** (`BACKEND_SWAP_ENDPOINT`, default `https://api.sodax.com/v1/swaps`)
 - `POST /submit-tx` — submit intent for processing (idempotent on `(txHash, srcChainKey)`; throttled 10/min/IP)
 - `GET /submit-tx/status?txHash=…&srcChainKey=…` — pipeline status (`pending → relaying → relayed → posting_execution → posted_execution → solved | failed`) with failure diagnostics. **Primary** poll signal. `solved` is the terminal success state (renamed from `executed` in a 2026 SODAX SDK rename; `executed` now only appears as `result.packetData.status`). A client must not wait for a `solved → executed` transition — there isn't one.
 
@@ -86,7 +86,7 @@ pnpm format:check           # Check formatting (CI use)
 All runtime config is via `.env` file (loaded with dotenv). Key variables:
 
 - `PRIVATE_KEY` — wallet private key (required)
-- `BACKEND_SWAP_ENDPOINT` — swaps v2 base URL (default: `https://api.sodax.com/v1/swaps`)
+- `BACKEND_SWAP_ENDPOINT` — swaps base URL (default: `https://api.sodax.com/v1/swaps`)
 - `SONIC_RPC_URL` — RPC endpoint (default: `https://rpc.soniclabs.com`)
 - `INPUT_AMOUNT_HUMAN` — human-readable amount (default: "1") OR `INPUT_AMOUNT` for raw base units
 - `MIN_OUTPUT_SLIPPAGE_BPS` — slippage in basis points (default: 500 = 5%)

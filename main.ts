@@ -49,7 +49,7 @@ function getTestCaseFromArgs(): TestCaseName {
 // MAIN
 // ----------------------------------------------------------------------------
 //
-// swaps v2 flow (Sonic same-chain USDT <-> USDC):
+// swaps flow (Sonic same-chain USDT <-> USDC):
 //   1. approve the intents contract to spend the input ERC20
 //   2. build + broadcast the create-intent tx via the SDK (returns { tx, intent, relayData })
 //   3. submit { txHash, srcChainKey, intent, relayData } to POST /v1/swaps/submit-tx
@@ -89,7 +89,7 @@ async function main() {
 
   const startMs = Date.now();
 
-  console.log(`\nSODAX Swap Intent (v2) — ${testCase.name}`);
+  console.log(`\nSODAX Swap Intent — ${testCase.name}`);
   console.log(`Wallet  : ${account.address}`);
   console.log(`Backend : ${backendBaseUrl}`);
   console.log(`RPC     : ${rpcUrl}`);
@@ -151,7 +151,7 @@ async function main() {
   );
   await submitIntent(payload, backendBaseUrl);
 
-  // Step 4: PRIMARY status — the swaps-api v2 submit-tx/status route.
+  // Step 4: PRIMARY status — the swaps-api submit-tx/status route.
   console.log(`\n[4/5] Poll swaps-api submit-tx/status`);
   await pollIntentStatus(txHash as string, backendBaseUrl, pollIntervalMs, pollTimeoutMs, 'sonic');
 

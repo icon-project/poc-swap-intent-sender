@@ -1,7 +1,7 @@
-# Sending Swap Intents to SODAX (Swaps v2)
+# Sending Swap Intents to SODAX
 
 A practical guide for a bot running on your own infra to submit swap intents to the
-SODAX **swaps v2** backend. The flow is the same for a same-chain swap (e.g. USDT→USDC
+SODAX **swaps** backend. The flow is the same for a same-chain swap (e.g. USDT→USDC
 on Sonic) and a cross-chain hop (e.g. USDT on Sonic → native ETH on Base): build and
 broadcast the intent with `@sodax/sdk`, then hand the tx to the swaps API for async
 execution and poll for the result.

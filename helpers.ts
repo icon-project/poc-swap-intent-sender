@@ -130,7 +130,7 @@ export const TEST_CASES: Record<TestCaseName, TestCase> = {
 };
 
 /**
- * Wire shape of `POST /v1/swaps/submit-tx` (swaps v2). The intent's bigint fields are
+ * Wire shape of `POST /v1/swaps/submit-tx` (swaps). The intent's bigint fields are
  * serialized as decimal strings; `srcChain`/`dstChain` are relay chain ids (the SDK's
  * `Intent` already produces these). `srcChainKey` is the source SpokeChainKey (e.g.
  * `sonic`, `0xa4b1.arbitrum`) — renamed from v1's `srcChainId`.
@@ -350,7 +350,7 @@ export type PollOptions = {
 };
 
 /**
- * PRIMARY status poll — the swaps-api v2 `GET /submit-tx/status` route. This is the endpoint
+ * PRIMARY status poll — the swaps-api `GET /submit-tx/status` route. This is the endpoint
  * under test: keyed exactly by `(txHash, srcChainKey)`, it reports the swaps-api pipeline's
  * own view (`pending → relaying → relayed → posting_execution → posted_execution → solved |
  * failed`) and, on failure, *why* (`failedAtStep` / `failureReason` / `userMessage`), plus the
@@ -439,7 +439,7 @@ export async function pollIntentStatus(
         console.log(`  Swap failed`);
         console.log(`  failedAtStep: ${body.data.failedAtStep ?? ''}`);
         console.log(`  failureReason: ${body.data.failureReason ?? ''}`);
-        // v2 status enrichment (swaps-api): user-facing hint + on-chain cancel flag + abandonment.
+        // status enrichment (swaps-api): user-facing hint + on-chain cancel flag + abandonment.
         if (body.data.userMessage) console.log(`  userMessage: ${body.data.userMessage}`);
         if (body.data.intentCancelled !== undefined)
           console.log(`  intentCancelled: ${body.data.intentCancelled}`);

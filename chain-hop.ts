@@ -307,7 +307,7 @@ async function executeHop(
   const confirmMs = Date.now() - tConfirmStart;
   console.log(`  Confirmed in block ${receipt.blockNumber}`);
 
-  // Step 3: Submit to the swaps v2 backend
+  // Step 3: Submit to the swaps backend
   const backendUrl = process.env.BACKEND_SWAP_ENDPOINT || 'https://api.sodax.com/v1/swaps';
 
   const payload = buildSubmitPayload(
@@ -318,7 +318,7 @@ async function executeHop(
     relayData.payload,
   );
 
-  console.log(`\n  Submitting to swaps v2...`);
+  console.log(`\n  Submitting to swaps...`);
   const tSubmitStart = Date.now();
   await submitIntent(payload, backendUrl);
   const submitMs = Date.now() - tSubmitStart;
@@ -405,7 +405,7 @@ async function executeHop(
     };
   }
 
-  // DEFAULT MODE: PRIMARY status — poll the swaps-api v2 submit-tx/status route (keyed by the
+  // DEFAULT MODE: PRIMARY status — poll the swaps-api submit-tx/status route (keyed by the
   // source-chain txHash + srcChainKey), then a single soft journal cross-check.
   console.log(`\n  Polling swaps-api submit-tx/status...`);
   const pollInterval = Number(process.env.POLL_INTERVAL_MS || '3000');

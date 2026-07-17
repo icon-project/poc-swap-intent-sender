@@ -1,12 +1,12 @@
 # Swap Intent Sender
 
-A runnable **reference client for the SODAX swaps v2 API** — clone it, run it, and read it as a canonical example of how to build, submit, and track a cross-chain swap intent.
+A runnable **reference client for the SODAX swaps API** — clone it, run it, and read it as a canonical example of how to build, submit, and track a cross-chain swap intent.
 
 ## What is SODAX?
 
 [SODAX](https://sodax.com) is a cross-network execution layer for on-chain money — it lets assets move, swap, and settle across many networks through a single intent-based flow. You express _what_ you want (swap token X on chain A for token Y on chain B); SODAX relays the intent to its hub chain, a solver fills it, and the output is delivered on the destination chain. Full docs: **[docs.sodax.com](https://docs.sodax.com)**.
 
-This repo demonstrates the swap path end-to-end against the **swaps v2** backend:
+This repo demonstrates the swap path end-to-end against the **swaps** backend:
 
 1. build an intent with `@sodax/sdk` and broadcast it on-chain,
 2. `POST /v1/swaps/submit-tx` to trigger relay + solver execution,
@@ -52,7 +52,7 @@ See `.env.example` for all available variables. Key ones:
 | Variable | Required | Description |
 |---|---|---|
 | `PRIVATE_KEY` | Yes | Wallet private key |
-| `BACKEND_SWAP_ENDPOINT` | No | Swaps v2 base URL for `submit-tx` + primary status poll (default: `https://api.sodax.com/v1/swaps`) |
+| `BACKEND_SWAP_ENDPOINT` | No | Swaps base URL for `submit-tx` + primary status poll (default: `https://api.sodax.com/v1/swaps`) |
 | `INTENT_API_ENDPOINT` | No | apps/api base URL for the journal cross-check (default: `https://api.sodax.com/v1/be`, the public gateway prefix) |
 | `JOURNAL_CROSSCHECK_TIMEOUT_MS` | No | Max wait for the journal to catch up during the cross-check (default: `90000`; a timeout is logged as inconclusive, never fatal) |
 | `INPUT_AMOUNT_HUMAN` | No | Swap amount in human units (default: `1`) |
@@ -137,7 +137,7 @@ sequenceDiagram
     participant U as Your app
     participant SDK as SODAX SDK
     participant Chain as Source chain
-    participant API as Swaps v2 API
+    participant API as Swaps API
     participant Solver as Relay and Solver
     participant J as Intent journal
 
@@ -156,7 +156,7 @@ sequenceDiagram
     J-->>U: open=false, intent-filled
 ```
 
-_Endpoints — Swaps v2 API: `https://api.sodax.com/v1/swaps` · Intent journal: `https://api.sodax.com/v1/be` (public gateway prefix)._
+_Endpoints — Swaps API: `https://api.sodax.com/v1/swaps` · Intent journal: `https://api.sodax.com/v1/be` (public gateway prefix)._
 
 **Terminal status:** `solved` = success, `failed` = failure. (`solved` was renamed from `executed` in a 2026 SODAX SDK rename; a client must not wait for a `solved → executed` transition — there isn't one. `executed` now appears only as `result.packetData.status`.)
 
@@ -184,7 +184,7 @@ Chains can be skipped at runtime via `DISABLED_CHAINS`. The hop sequence auto-re
 
 This repo is set up so that [Claude Code](https://claude.com/claude-code) can help you integrate SODAX. After cloning, just run `claude` in the repo directory.
 
-- **`CLAUDE.md`** gives Claude the project context — the swaps v2 flow, the API contract, and safety guardrails.
+- **`CLAUDE.md`** gives Claude the project context — the swaps flow, the API contract, and safety guardrails.
 - **`.mcp.json`** registers the public **SODAX Builders MCP** server (`https://builders.sodax.com/sse`). On first run Claude Code will ask you to approve it; once enabled, Claude can pull **live** SODAX data — supported chains and tokens, solver quotes, the orderbook, config — and search the docs, instead of guessing.
 
 Things you can ask Claude in this repo:

@@ -799,25 +799,7 @@ async function executeAllHops(
     const hop = buildHop(currentChain, dstKey);
     const hopNum = i + 1;
 
-    // Snapshot the destination's native balance BEFORE the hop runs. If the hop reports a
-    // failure/timeout, the guard below treats funds as "arrived" only when the balance rose
-    // above this baseline — a real delta from THIS hop — so pre-existing dust / prefunded gas /
-    // a prior run can't be misread as a settled hop. Never abort the whole run on a transient
-    // RPC hiccup here: a failed read just leaves the baseline unknown (null), which disables the
-    // balance-delta signal for this hop and defers to the authoritative journal check.
     const dstChain = CHAIN_DEFS[dstKey];
-    let dstBalanceBefore: bigint | null = null;
-    try {
-      dstBalanceBefore = await getNativeBalance(
-        getRpcUrl(dstChain),
-        dstChain.viemChain,
-        walletAddress,
-      );
-    } catch (err: any) {
-      console.log(
-        `  (pre-hop ${dstChain.name} balance read failed: ${err.message} — delta check disabled for this hop)`,
-      );
-    }
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`=== Hop ${hopNum}/${destinations.length}: ${hop.label} ===`);
@@ -852,20 +834,18 @@ async function executeAllHops(
 
     if (!advanced) {
       // A reported failure/timeout is NOT proof the swap didn't fill: the status poll can give
-      // up before the fill lands (hub->spoke delivery lags), or misreport. Before assuming the
-      // funds stayed on the source chain and rewiring around this hop, verify against
-      // independent on-chain signals — did THIS intent settle in the journal, and/or did native
-      // funds actually arrive on the destination? If so, treat the hop as settled and advance.
+      // up before the fill lands, or misreport. Before assuming the funds stayed on the source
+      // chain and rewiring around this hop, cross-check the intent journal, which is
+      // authoritative for THIS exact intent. Give it the same aggregator-lag budget the rest
+      // of the repo uses for journal checks (JOURNAL_CROSSCHECK_TIMEOUT_MS, default 90s) —
+      // a shorter window would wrongly conclude "not filled" during normal journal lag and
+      // rewire around an already-settled hop.
+      //
+      // The destination native balance is deliberately NOT used as an advance signal: at this
+      // checkpoint hub->spoke delivery almost always still lags (so it can't corroborate), and
+      // a bare balance rise isn't specific to this intent. The journal alone decides.
       const apiBaseUrl = process.env.INTENT_API_ENDPOINT || 'https://api.sodax.com/v1/be';
-      const dstRpcUrl = getRpcUrl(dstChain);
-
-      console.log(
-        `  Reported "${result.status}" — cross-checking journal + ${dstChain.name} balance before rewiring...`,
-      );
-      // Journal is authoritative for THIS exact intent. The balance signal must be a real
-      // DELTA vs the pre-hop snapshot (funds increased during this hop) — an absolute
-      // "> gas buffer" test would treat pre-existing dust / prefunded gas / prior-run funds
-      // as this hop's arrival and wrongly advance.
+      const journalTimeout = Number(process.env.JOURNAL_CROSSCHECK_TIMEOUT_MS || '90000');
       // Sonic-source hops broadcast the hub intent tx directly (instance-precise lookup by
       // txHash); cross-chain (spoke-source) hops use intentHash. `currentChain` is still the
       // source here (only advanced below), so it identifies the hop's source.
@@ -875,39 +855,27 @@ async function executeAllHops(
           : result.intentHash
             ? { intentHash: result.intentHash }
             : null;
-      const journalFilled = guardLookup
-        ? await confirmIntentFilled(apiBaseUrl, guardLookup)
-        : false;
-      const journalDesc = guardLookup ? 'not filled' : 'no lookup key';
-      // Balance-delta signal: only usable if we have a pre-hop baseline AND this read succeeds.
-      // Any RPC failure here just drops the balance signal (fall back to the journal) rather
-      // than crashing the run.
-      let fundsArrived = false;
-      let balanceDesc = 'balance signal unavailable';
-      try {
-        const dstBalanceNow = await getNativeBalance(dstRpcUrl, dstChain.viemChain, walletAddress);
-        fundsArrived = dstBalanceBefore !== null && dstBalanceNow > dstBalanceBefore;
-        balanceDesc =
-          dstBalanceBefore === null
-            ? `${dstChain.name} balance ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)} (no baseline)`
-            : `${dstChain.name} balance ${formatNativeBalance(dstBalanceBefore, dstChain.nativeSymbol)} -> ${formatNativeBalance(dstBalanceNow, dstChain.nativeSymbol)}`;
-      } catch (err: any) {
-        console.log(`  (${dstChain.name} balance read failed: ${err.message})`);
-      }
 
-      if (journalFilled || fundsArrived) {
-        const why = journalFilled ? 'journal shows intent-filled' : `${dstChain.name} balance rose`;
+      console.log(
+        `  Reported "${result.status}" — cross-checking the intent journal before rewiring...`,
+      );
+      const journalFilled = guardLookup
+        ? await confirmIntentFilled(apiBaseUrl, guardLookup, journalTimeout)
+        : false;
+
+      if (journalFilled) {
         console.log(
-          `  On-chain signals say the hop settled (${why}) — advancing to ${dstChain.name}.`,
+          `  Journal shows intent-filled — the hop settled; advancing to ${dstChain.name}.`,
         );
         result.status = 'solved';
         advanced = true;
       } else {
-        // Note: this is a LACK of positive settlement evidence, not proof the hop didn't
-        // fill — the signals may simply be unavailable (no lookup key / no balance baseline).
+        // A LACK of positive evidence, not proof the hop didn't fill — the journal may simply
+        // not have caught up, or there was no lookup key (hop threw before broadcasting).
+        const why = guardLookup ? 'journal not filled within timeout' : 'no journal lookup key';
         console.log(
-          `  No settlement evidence (journal: ${journalDesc}; ${balanceDesc}) — ` +
-            `assuming funds remain on ${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
+          `  No settlement evidence (${why}) — assuming funds remain on ` +
+            `${CHAIN_DEFS[currentChain].name}, will rewire next hop.`,
         );
       }
     }

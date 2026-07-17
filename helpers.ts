@@ -614,8 +614,13 @@ export async function confirmIntentFilled(
   const url = `${apiBaseUrl}/${path}`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // Bound each request so a stalled/hanging fetch can't block past `deadline` — otherwise the
+    // "respects timeoutMs / never throws" contract breaks and the rewire guard could hang.
+    const controller = new AbortController();
+    const perRequestMs = Math.max(1000, Math.min(intervalMs, deadline - Date.now()));
+    const abortTimer = setTimeout(() => controller.abort(), perRequestMs);
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: controller.signal });
       if (response.ok) {
         const journal = (await response.json()) as IntentJournalResponse;
         // `open: false` = terminal; treat only an explicit `intent-filled` event as settled.
@@ -624,7 +629,9 @@ export async function confirmIntentFilled(
         }
       }
     } catch {
-      // Network/parse hiccup — retry until the deadline.
+      // Network/parse/abort (per-request timeout) hiccup — retry until the deadline.
+    } finally {
+      clearTimeout(abortTimer);
     }
     await sleep(intervalMs);
   }

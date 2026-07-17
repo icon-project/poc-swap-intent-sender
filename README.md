@@ -13,7 +13,7 @@ This repo demonstrates the swap path end-to-end against the **swaps v2** backend
 3. poll `GET /v1/swaps/submit-tx/status` to a terminal state (`solved` / `failed`),
 4. confirm independently on-chain via the intent journal.
 
-Submission is keyed by `srcChainKey` (a SODAX `SpokeChainKey` such as `sonic` or `0xa4b1.arbitrum`). The legacy v1 path `/v1/bes/swaps/*` is retired (→ gateway 404); use `/v1/swaps`.
+Submission is keyed by `srcChainKey` (a SODAX `SpokeChainKey` such as `sonic` or `0xa4b1.arbitrum`).
 
 > 📖 **Building a bot against the swaps endpoint?** Read [`INSTRUCTIONS.md`](./INSTRUCTIONS.md) — a concise integration guide with exact payload/response shapes and operational gotchas.
 

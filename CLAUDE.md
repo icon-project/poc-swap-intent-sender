@@ -259,3 +259,39 @@ skip it; say so.
 - Target: ES2022, Module: CommonJS, Strict mode enabled
 - Runtime: `tsx` (TypeScript execution without compilation step)
 - Package manager: `pnpm`
+
+<!-- BEGIN LOCAL DEV RESOURCE COMMANDS -->
+## Resource-safe commands for AI agents (shared dev server)
+
+> **Read `~/CLAUDE.md` → "Shared dev-server resource policy" first.** It defines `dev-status`, the go/no-go thresholds (RAM < 8 GiB, swap > 8 GiB, load > 20, another heavy job running) and the `heavy-run` lock. This section only maps that policy onto this repo.
+>
+> These are **instructions for which commands an interactive AI agent runs on this dev box.** They change nothing for developers or CI, and **no `package.json` or `tsconfig.json` may be edited to enforce them.**
+
+**Package manager:** `pnpm@10.30.3` (single package, `tsx` runtime — no compile/build step).
+**Test runner:** **none — no Vitest, no Jest, no test suite.** Verification is `pnpm checkTs` + `pnpm format:check`.
+**Existing scripts** (see [Commands](#commands) above — unchanged): `pnpm start`, the `sonic-*` / `hop-*` / `chain-hop` flows, `pnpm cancel`, `pnpm balances`, `pnpm sweep`, `pnpm checkTs`, `pnpm format`, `pnpm format:check`.
+
+### Targeted first — run these directly, no `heavy-run`
+
+This repo is small; typechecking and formatting are cheap:
+
+```bash
+pnpm checkTs
+pnpm format:check
+```
+
+### Repository-wide — `heavy-run`, and tell the user first
+
+Only the install is genuinely expensive here:
+
+```bash
+heavy-run timeout 20m pnpm install
+```
+
+### ⚠️ Never wrap the on-chain scripts in `timeout`
+
+`pnpm start`, the `hop-*` targets, `chain-hop`, `sweep`, and `cancel` **submit real transactions and then poll for settlement**. Killing one mid-flight does not undo the transaction — it just loses track of an intent that is already on-chain, which is exactly the failure the [Safety guardrails](#safety-guardrails-non-negotiable) exist to prevent. So for these:
+
+- **No `timeout`**, no `heavy-run` (they are network-bound, not CPU-bound — they don't need the lock and shouldn't hold it while polling).
+- Run them in the **foreground**, one at a time, and only with the user's explicit go-ahead per the guardrails above.
+<!-- END LOCAL DEV RESOURCE COMMANDS -->

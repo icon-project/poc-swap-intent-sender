@@ -1,6 +1,9 @@
 node_modules
 .env
+.claude/settings.local.json
 chain-hop-summary-*.txt
 chain-hop-profile-*.txt
 chain-hop-profile-*.json
 chain-hop-profile-*.csv
+leverage-yield-proof-*.txt
+leverage-yield-proof-*.json

@@ -62,6 +62,7 @@ See `.env.example` for all available variables. Key ones:
 | `POLL_TIMEOUT_MS` | No | Status poll timeout (default: `120000`) |
 | `DISABLED_CHAINS` | No | JSON array of chain keys to skip (e.g., `["optimism","redbelly"]`) |
 | `<CHAIN>_RPC_URL` | No | RPC override per chain (e.g., `BASE_RPC_URL`) |
+| `LEVERAGE_YIELD_ENDPOINT` | Only for `pnpm leverage:*` | Base URL for the `/leverage-yield/*` routes. **A raw origin with no `/v1` prefix** — these routes are not fronted by the public gateway yet, so paths sit directly on the origin. Ask the SODAX team for the origin; the other `LEVERAGE_*` knobs are documented in `.env.example`. |
 
 ## Scripts
 
@@ -114,6 +115,43 @@ Resolves the `intentId` to its full `Intent` struct via the journal (`GET {INTEN
 | `pnpm hop-lightlink-to-sonic` | ETH(LightLink) → USDT(Sonic) |
 | `pnpm hop-redbelly-to-sonic` | RBNT(Redbelly) → USDT(Sonic) |
 | `pnpm hop-kaia-to-sonic` | KAIA(Kaia) → USDT(Sonic) |
+
+### Leverage Yield (vault deposit / withdraw)
+
+The Leverage Yield API lets you swap any supported token into a leveraged LSD vault position
+(`lsoda*` shares, 18 decimals) and back out again. It is a **separate API surface** from swaps:
+the backend builds every unsigned transaction and hands it back, so the client is plain `fetch`
+plus local signing — no SDK leverage module is used here.
+
+| Command | Description |
+|---|---|
+| `pnpm leverage:vaults` | **Read-only.** Lists vaults, quotes both directions, shows your derived hub wallet + share position, and asserts the malformed-vault `400`. Spends nothing. |
+| `pnpm leverage:deposit` | Leg 1 — spoke token → `lsoda*` shares. **Spends real funds.** |
+| `pnpm leverage:withdraw` | Leg 2 — `lsoda*` shares → token. **Spends real funds.** |
+| `pnpm leverage:round-trip` | Both legs back to back. **Spends real funds.** |
+
+Requires `LEVERAGE_YIELD_ENDPOINT` (see Environment Variables). Start with `pnpm leverage:vaults`.
+
+Flow per leg — `POST /leverage-yield/quote/{deposit,withdraw}` → `POST /leverage-yield/intents/{deposit,withdraw}`
+→ sign and broadcast the returned `tx` on `srcChainKey` → `POST /leverage-yield/submit-tx` (with
+`operation: "deposit" | "withdraw"`) → poll `GET /leverage-yield/submit-tx/status` to `solved` / `failed`.
+Deposits add an `allowance/check` → `approve` step; **withdrawals have no approve step** — the shares
+live in your derived hub wallet and the backend bundles that approval itself.
+
+Things worth knowing:
+
+- **Shares are owned by your derived hub wallet, not your EOA.** `share-balance` / `max-withdraw` take
+  that address as `owner`; the script reads it from `intent.creator` in the create-intent response.
+- **`max-withdraw` returns the raw on-chain value, not dust-trimmed.** Feeding it back verbatim can trip
+  the vault's share round-up and revert, so a small buffer (`LEVERAGE_WITHDRAW_BUFFER_BPS`) is subtracted.
+  It can also sit well below your `share-balance` (the leveraged position caps it), so **a single
+  withdraw won't fully exit a vault** — expect leftover shares and repeat if you want out completely.
+- Quotes are never passed through verbatim — `minOutputAmount` is the quote minus `LEVERAGE_SLIPPAGE_BPS`.
+- `deadline` defaults to hub block time + 5 minutes if omitted; the script sends an explicit, longer one.
+- Leverage withdrawals cannot carry a `partnerFee` (deposits can) — see `icon-project/sodax-sdks#325`.
+- Each run writes a `leverage-yield-proof-*.{txt,json}` report (gitignored) with the source tx hash and
+  the full final status response per leg. The report **redacts the origin**; console output does not, so
+  paste the report rather than raw console logs.
 
 ### Utilities
 
@@ -207,6 +245,9 @@ Things you can ask Claude in this repo:
 | Journal cross-check "inconclusive" | The aggregator can lag the swaps-api by a few blocks; this is soft and never fails the run. Raise `JOURNAL_CROSSCHECK_TIMEOUT_MS` if needed. |
 | `429 Too Many Requests` on submit | `submit-tx` is throttled ~10/min/IP. Back off and retry — it's idempotent on `(txHash, srcChainKey)`. |
 | Cross-chain funds slow to arrive | Hub→spoke delivery can lag the `solved` status by minutes; poll the destination balance with a generous timeout. |
+| `400 vault must be an Ethereum address` | A `leverage-yield` request had a malformed `vault`. Take the address from `GET /leverage-yield/vaults`. |
+| Leverage `share-balance` returns `0` after a successful deposit | You queried your EOA. The `owner` is your **derived hub wallet** — read it from `intent.creator` in the create-intent response. |
+| Leverage withdraw reverts on-chain | `max-withdraw` is the raw, non-dust-trimmed value; the vault's share round-up can push it over. Raise `LEVERAGE_WITHDRAW_BUFFER_BPS`. |
 
 ## Links & support
 

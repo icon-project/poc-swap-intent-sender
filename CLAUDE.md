@@ -226,6 +226,15 @@ public `/v1/leverage-yield/*` gateway route).
 - **`share-balance` / `max-withdraw` take the derived HUB WALLET as `owner`, not the EOA.** Read it
   from `intent.creator` (equals `relayData.address`) in any create-intent response. Against the EOA
   both endpoints return `0`, which looks like "the deposit didn't land" but isn't.
+- **The derived hub wallet is PER SOURCE SPOKE, not per EOA.** The same EOA maps to a different hub
+  wallet for each `srcChainKey`, so **shares deposited from one spoke cannot be withdrawn from
+  another** — each spoke has its own share position. Verified for EOA
+  `0x096bd6…Ca01`: `sonic` → `0x2636309e…32b2`, `0xa4b1.arbitrum` → `0xd4AB147f…B17C`. Always resolve
+  the hub wallet with the **same `srcChainKey`** you intend to withdraw from.
+- **`intents/withdraw` returns `422` when that spoke's hub wallet holds no shares** (code
+  `INTENT_CREATION_FAILED`), because the builder simulates the hub-wallet call. The body carries a raw
+  viem revert dump rather than a plain "insufficient shares", so check `share-balance` first to tell
+  "nothing deposited from this spoke" apart from a real failure.
 - **`max-withdraw` returns the RAW on-chain value, NOT dust-trimmed.** Feeding it back verbatim can
   trip the vault's share round-up and revert — subtract a buffer (`LEVERAGE_WITHDRAW_BUFFER_BPS`).
 - **`max-withdraw` can be well below `share-balance`** — the leveraged position caps how much is

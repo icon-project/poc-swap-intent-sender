@@ -142,6 +142,10 @@ Things worth knowing:
 
 - **Shares are owned by your derived hub wallet, not your EOA.** `share-balance` / `max-withdraw` take
   that address as `owner`; the script reads it from `intent.creator` in the create-intent response.
+- **That hub wallet is per source spoke.** The same EOA gets a different hub wallet for each
+  `srcChainKey`, so **shares deposited from one chain cannot be withdrawn from another** — deposit and
+  withdraw with the same `LEVERAGE_SRC_CHAIN_KEY`. Withdrawing from a spoke with no shares returns a
+  `422`, so check `pnpm leverage:vaults` (which reports the position) first.
 - **`max-withdraw` returns the raw on-chain value, not dust-trimmed.** Feeding it back verbatim can trip
   the vault's share round-up and revert, so a small buffer (`LEVERAGE_WITHDRAW_BUFFER_BPS`) is subtracted.
   It can also sit well below your `share-balance` (the leveraged position caps it), so **a single

@@ -179,15 +179,39 @@ type Config = {
   inputAmountHuman?: string;
 };
 
+/** Look a chain up by either registry key (`arbitrum`) or SpokeChainKey (`0xa4b1.arbitrum`). */
+function findChainDef(value: string): ChainDef | undefined {
+  return (
+    CHAIN_DEFS[value] ?? Object.values(CHAIN_DEFS).find((d) => d.chainKey.toLowerCase() === value)
+  );
+}
+
 function resolveChainDef(envVar: string, fallbackKey: string): ChainDef {
-  const key = (process.env[envVar] || fallbackKey).toLowerCase();
-  const def = CHAIN_DEFS[key];
+  const key = (process.env[envVar] || fallbackKey).trim().toLowerCase();
+  const def = findChainDef(key);
   if (!def) {
     throw new Error(
       `${envVar}='${key}' is not a known chain. Valid keys: ${Object.keys(CHAIN_DEFS).join(', ')}`,
     );
   }
   return def;
+}
+
+/**
+ * Resolve a destination chain to the **SpokeChainKey the API expects**, accepting either spelling.
+ * Without this, `LEVERAGE_DST_CHAIN_KEY=arbitrum` would be forwarded verbatim and the backend would
+ * reject it — the registry key (`arbitrum`) and the wire key (`0xa4b1.arbitrum`) are not the same.
+ */
+function resolveSpokeChainKey(envVar: string, fallback: string): string {
+  const raw = process.env[envVar];
+  if (!raw) return fallback;
+  const def = findChainDef(raw.trim().toLowerCase());
+  if (!def) {
+    throw new Error(
+      `${envVar}='${raw}' is not a known chain. Valid keys: ${Object.keys(CHAIN_DEFS).join(', ')}`,
+    );
+  }
+  return def.chainKey;
 }
 
 function getTokenEnv(name: string, fallback: Address): Address {
@@ -201,7 +225,7 @@ function loadConfig(): Config {
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
   const account = privateKeyToAccount(privateKey);
   const srcChain = resolveChainDef('LEVERAGE_SRC_CHAIN_KEY', 'sonic');
-  const dstChainKey = (process.env.LEVERAGE_DST_CHAIN_KEY || srcChain.chainKey).toLowerCase();
+  const dstChainKey = resolveSpokeChainKey('LEVERAGE_DST_CHAIN_KEY', srcChain.chainKey);
 
   // Default input: USDT on Sonic (what this wallet holds), native gas token elsewhere —
   // the same convention `chain-hop.ts` uses for spokes.

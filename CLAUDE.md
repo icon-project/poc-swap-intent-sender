@@ -41,6 +41,7 @@ pnpm leverage:vaults        # READ-ONLY leverage-yield discovery (vaults, quotes
 pnpm leverage:deposit       # Leverage Yield leg 1: token -> lsoda* vault shares
 pnpm leverage:withdraw      # Leverage Yield leg 2: lsoda* shares -> token
 pnpm leverage:round-trip    # Both leverage legs back to back
+                            # ^ all three honour LEVERAGE_SRC_CHAIN_KEY=solana (non-EVM path)
 pnpm checkTs                # Type-check without emitting
 pnpm format                 # Prettier format all .ts/.json files
 pnpm format:check           # Check formatting (CI use)
@@ -59,7 +60,7 @@ pnpm format:check           # Check formatting (CI use)
 | `helpers.ts` | Env helpers, ERC20/approval utils, `buildSubmitPayload`, submit/poll, `findIntentById`/`journalIntentToSdkIntent`, types/constants |
 | `sdk-helpers.ts` | `ViemWalletProvider` (`IEvmWalletProvider`), chain registry, balance helpers, disabled-chain logic |
 | `chain-hop.ts` | Cross-chain hop demo (also targets swaps) |
-| `leverage-yield.ts` | Leverage Yield money-path test (`/leverage-yield/*`) — deposit + withdraw legs, plain `fetch` + viem signing, no SDK leverage module |
+| `leverage-yield.ts` | Leverage Yield money-path test (`/leverage-yield/*`) — deposit + withdraw legs from an EVM spoke **or Solana**, plain `fetch` + viem/ed25519 signing, no SDK leverage module |
 | `intents.abi.ts` | Full ABI for the Intent contract (auto-generated). No longer imported — kept for reference. |
 
 ### Pipeline steps (in main.ts)
@@ -226,11 +227,13 @@ public `/v1/leverage-yield/*` gateway route).
 - **`share-balance` / `max-withdraw` take the derived HUB WALLET as `owner`, not the EOA.** Read it
   from `intent.creator` (equals `relayData.address`) in any create-intent response. Against the EOA
   both endpoints return `0`, which looks like "the deposit didn't land" but isn't.
-- **The derived hub wallet is PER SOURCE SPOKE, not per EOA.** The same EOA maps to a different hub
-  wallet for each `srcChainKey`, so **shares deposited from one spoke cannot be withdrawn from
-  another** — each spoke has its own share position. Verified for EOA
-  `0x096bd6…Ca01`: `sonic` → `0x2636309e…32b2`, `0xa4b1.arbitrum` → `0xd4AB147f…B17C`. Always resolve
-  the hub wallet with the **same `srcChainKey`** you intend to withdraw from.
+- **The derived hub wallet is PER SOURCE SPOKE + SIGNER, not per EOA, and is vault-independent.**
+  The same signer maps to a different hub wallet for each `srcChainKey`, so **shares deposited from
+  one spoke cannot be withdrawn from another** — each spoke has its own share position. It does
+  *not* vary by vault (verified across all three). Verified for signer
+  `0x096bd6…Ca01`: `sonic` → `0x2636309e…32b2`, `0xa4b1.arbitrum` → `0xd4AB147f…B17C`; and for the
+  Solana signer `E7Vfi7N4…iaEk`: `solana` → `0xAF486173…2957`. Always resolve the hub wallet with the
+  **same `srcChainKey` and the same `srcAddress`** you intend to withdraw from — never hard-code it.
 - **`intents/withdraw` returns `422` when that spoke's hub wallet holds no shares** (code
   `INTENT_CREATION_FAILED`), because the builder simulates the hub-wallet call. The body carries a raw
   viem revert dump rather than a plain "insufficient shares", so check `share-balance` first to tell
@@ -256,12 +259,40 @@ fund-spending run writes `leverage-yield-proof-<ts>.{txt,json}` (gitignored) con
 source tx hash + `srcChainKey` and the **full final `submit-tx/status` response** — the proof #1029
 needs. **The report redacts the origin; console output does not**, so paste the report, not raw logs.
 
-### Not covered: split-tx withdraw from Solana / Bitcoin
+### Solana source — the split-tx / `hubWalletSwap` path (#1029 leg 3)
 
-#1029 also asks for a withdraw sourced from Solana or Bitcoin. **This repo cannot do it**: there is
-no Solana keypair or Bitcoin PSBT signing anywhere, and `solana` is not in `CHAIN_DEFS` (only an
-unused `SOLANA_RPC_URL` in `.env`). It needs a non-EVM signer — do not fake it and do not silently
-skip it; say so.
+`LEVERAGE_SRC_CHAIN_KEY=solana` runs either leg from Solana instead of an EVM spoke. This is the
+highest-risk path in #1029: the user signs on a non-EVM spoke while the intent and the shares stay
+hub-side.
+
+- **No Solana SDK support is needed, and none is used.** `intents/*` returns `tx.data` as **base64 of
+  a fully serialized unsigned v0 `VersionedTransaction`** (one empty signature slot + the message,
+  blockhash already baked in). The client only deserializes, signs ed25519, and pushes raw bytes —
+  see `signAndSendSolana`. `@sodax/sdk` rc.11 has no `ISolanaWalletProvider` and does not need one.
+- **The signer is derived from the existing `PRIVATE_KEY`**: a 32-byte key is also a valid ed25519
+  seed, so there is no second secret. The Solana pubkey is unrelated to the EVM address —
+  `0x096bd6…Ca01` ↔ `E7Vfi7N4uixwcjhipDQJmQMh9scazFLeEzrmeymWiaEk`. `SOLANA_PRIVATE_KEY` overrides it
+  (JSON array of 64 bytes, or 128 hex chars) to import a wallet that already holds SOL.
+- **`srcAddress` / `walletAddress` must be the base58 pubkey.** Passing the EVM address on the Solana
+  spoke fails with `leverageYield.deposit failed: Non-base58 character`. `submit-tx` validates
+  `walletAddress` as a 1–127 char string rather than an EVM address precisely so this works.
+- **The txHash is a base58 signature, not `0x…`** — that string is what `submit-tx` and
+  `submit-tx/status` key on. Every hash/evidence type is therefore `string`, not `Hex`.
+- **Blockhash expiry is the one genuinely new failure mode.** The embedded blockhash lives ~60–90s,
+  so build and broadcast must be back to back and a stale payload can never be resent. On a
+  *provable* expiry (`isBlockhashValid` returns false with no signature status) `buildSignSend`
+  re-calls `intents/*` for fresh bytes, up to 3 attempts. A bare timeout is deliberately **not**
+  treated as expiry — it cannot distinguish "dead" from "slow", and rebuilding on "slow" would risk a
+  second deposit. A rebuild yields a *different* intent, so only the pair that confirmed is submitted.
+- **Native SOL is the cheapest input** (no associated-token-account rent). SPL inputs are not
+  implemented for a Solana source and fail with a clear error rather than a wrong balance read.
+- A native SOL deposit must leave fee headroom — the script refuses to leave under 0.001 SOL.
+
+### Not covered: split-tx withdraw from Bitcoin
+
+#1029 accepts Solana **or** Bitcoin; this repo does Solana (above). Bitcoin is still not possible
+here — there is no PSBT construction, UTXO selection or change handling, and no evidence the API
+returns a ready-to-sign artifact for it. Do not fake it and do not silently skip it; say so.
 
 ## TypeScript
 

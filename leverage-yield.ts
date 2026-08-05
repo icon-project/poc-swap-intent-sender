@@ -11,7 +11,8 @@ import {
   parseUnits,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { EvmRawTransaction } from '@sodax/sdk';
+import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import type { EvmRawTransaction, SpokeChainKey } from '@sodax/sdk';
 import {
   erc20Abi,
   formatElapsed,
@@ -26,6 +27,9 @@ import {
   CHAIN_DEFS,
   type ChainDef,
   NATIVE,
+  SOLANA_DEF,
+  SOLANA_NATIVE,
+  type SolanaChainDef,
   SONIC_USDT,
   ViemWalletProvider,
   getRpcUrl,
@@ -45,6 +49,12 @@ dotenv.config();
 // Two legs, both signed with the wallet this repo already uses:
 //   Leg 1  deposit  — any spoke token  → lsoda* vault shares
 //   Leg 2  withdraw — lsoda* shares    → any token (no approve step; hub-wallet path)
+//
+// Both legs run from an EVM spoke or from Solana (`LEVERAGE_SRC_CHAIN_KEY=solana`). The
+// Solana source is #1029's leg 3 — the split-tx / `hubWalletSwap` path, where the user signs
+// on a non-EVM spoke while the intent and the shares live hub-side. It needs no Solana SDK
+// support: the backend returns the whole transaction already serialized, so the only extra
+// work is ed25519 signing (see `signAndSendSolana`) and coping with blockhash expiry.
 //
 // Deliberately NOT using the SDK's leverage module: `@sodax/sdk` is pinned at
 // 2.0.0-rc.11 here and the leverage module landed in rc.21. It isn't needed —
@@ -98,8 +108,17 @@ type Vault = {
 
 type QuoteResponse = { quotedAmount: string };
 
-/** An unsigned tx built by the backend — fed straight to the wallet provider. */
-type UnsignedTx = { from?: Address; to: Address; data: Hex; value?: string };
+/**
+ * An unsigned tx built by the backend. Deliberately typed loosely because its contents are
+ * chain-specific:
+ *
+ * - **EVM**: `to` is a `0x…` contract address and `data` is calldata hex — fed to the wallet
+ *   provider as-is.
+ * - **Solana**: `data` is base64 of a *fully serialized* unsigned v0 `VersionedTransaction`
+ *   (empty signature slot + message, blockhash already baked in). `to` is incidental; there is
+ *   nothing left to assemble locally.
+ */
+type UnsignedTx = { from?: string; to: string; data: string; value?: string };
 
 /**
  * The intent as the backend serializes it (bigints already decimal strings). It goes back
@@ -110,7 +129,12 @@ type BackendIntent = Record<string, unknown> & { creator: Address; intentId: str
 type CreateIntentResponse = {
   tx: UnsignedTx;
   intent: BackendIntent;
-  relayData: { address: Address; payload: Hex };
+  /**
+   * `address` is the derived hub wallet (always an EVM address, even for a Solana source).
+   * `payload` is relay-consumed and only actually read for non-EVM sources — EVM flows relay
+   * `{ chain_id, tx_hash }` and ignore it.
+   */
+  relayData: { address: Address; payload: string };
 };
 
 type SubmitResponse = {
@@ -160,15 +184,163 @@ async function postRaw(url: string, body: unknown): Promise<{ status: number; bo
 // CONFIG
 // ----------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------
+// CHAIN REGISTRY (EVM + Solana)
+// ----------------------------------------------------------------------------
+//
+// Leg 3 means the source spoke can no longer be assumed EVM. `ChainEntry` is the discriminated
+// union every chain-sensitive path branches on. The fields shared by both chain types are flat
+// so the bulk of the script reads unchanged; the chain-specific plumbing hangs off `evm` /
+// `solana` and is only reachable after narrowing on `kind`.
+
+type ChainCommon = {
+  chainKey: SpokeChainKey;
+  name: string;
+  nativeSymbol: string;
+  nativeDecimals: number;
+};
+
+type ChainEntry =
+  | (ChainCommon & { kind: 'evm'; evm: ChainDef })
+  | (ChainCommon & { kind: 'solana'; solana: SolanaChainDef });
+
+/** Every chain this script can source from or pay out to, keyed by short registry name. */
+const CHAIN_ENTRIES: Record<string, ChainEntry> = {
+  ...Object.fromEntries(
+    Object.entries(CHAIN_DEFS).map(([key, def]): [string, ChainEntry] => [
+      key,
+      {
+        kind: 'evm',
+        chainKey: def.chainKey,
+        name: def.name,
+        nativeSymbol: def.nativeSymbol,
+        nativeDecimals: 18,
+        evm: def,
+      },
+    ]),
+  ),
+  solana: {
+    kind: 'solana',
+    chainKey: SOLANA_DEF.chainKey,
+    name: SOLANA_DEF.name,
+    nativeSymbol: SOLANA_DEF.nativeSymbol,
+    nativeDecimals: SOLANA_DEF.nativeDecimals,
+    solana: SOLANA_DEF,
+  },
+};
+
+const CHAIN_KEY_LIST = Object.keys(CHAIN_ENTRIES).join(', ');
+
+/** Look a chain up by registry key (`arbitrum`, `solana`) or SpokeChainKey (`0xa4b1.arbitrum`). */
+function findChainEntry(value: string): ChainEntry | undefined {
+  return (
+    CHAIN_ENTRIES[value] ??
+    Object.values(CHAIN_ENTRIES).find((e) => e.chainKey.toLowerCase() === value)
+  );
+}
+
+function resolveChainEntry(envVar: string, fallbackKey: string): ChainEntry {
+  const key = (process.env[envVar] || fallbackKey).trim().toLowerCase();
+  const entry = findChainEntry(key);
+  if (!entry) {
+    throw new Error(`${envVar}='${key}' is not a known chain. Valid keys: ${CHAIN_KEY_LIST}`);
+  }
+  return entry;
+}
+
+/**
+ * EVM-only plumbing (viem chain + RPC env var). Every caller narrows on `kind` first; this
+ * exists so the narrowing failure is a clear error rather than an undefined dereference.
+ */
+function requireEvm(chain: ChainEntry): ChainDef {
+  if (chain.kind !== 'evm') {
+    throw new Error(`${chain.name} is not an EVM chain — this code path requires an EVM source`);
+  }
+  return chain.evm;
+}
+
+// ----------------------------------------------------------------------------
+// SOLANA SIGNER
+// ----------------------------------------------------------------------------
+
+let cachedSolanaKeypair: Keypair | undefined;
+
+/**
+ * The Solana signer.
+ *
+ * By default it is derived from the **existing `PRIVATE_KEY`** — a 32-byte secp256k1 key is
+ * also a valid ed25519 seed, so this demo wallet needs no second secret to manage. The two
+ * addresses are unrelated: the same `.env` yields one EVM EOA and one Solana pubkey.
+ *
+ * `SOLANA_PRIVATE_KEY` overrides it with a real Solana key — useful for importing a wallet
+ * that already holds SOL. Accepts a JSON array of 64 bytes (`solana-keygen` / `id.json`) or
+ * 128 hex chars. A base58 export (e.g. Phantom) must be converted to one of those first;
+ * decoding base58 here would mean pulling in another dependency for no real gain.
+ */
+function solanaKeypair(privateKey: Hex): Keypair {
+  if (cachedSolanaKeypair) return cachedSolanaKeypair;
+
+  const override = process.env.SOLANA_PRIVATE_KEY?.trim();
+  if (override) {
+    cachedSolanaKeypair = Keypair.fromSecretKey(parseSolanaSecretKey(override));
+    return cachedSolanaKeypair;
+  }
+
+  const seed = Buffer.from(privateKey.slice(2), 'hex');
+  if (seed.length !== 32) {
+    throw new Error(
+      `PRIVATE_KEY must be 32 bytes (64 hex chars) to derive a Solana keypair, got ${seed.length}. Set SOLANA_PRIVATE_KEY instead.`,
+    );
+  }
+  cachedSolanaKeypair = Keypair.fromSeed(seed);
+  return cachedSolanaKeypair;
+}
+
+function parseSolanaSecretKey(raw: string): Uint8Array {
+  if (raw.startsWith('[')) {
+    const bytes: unknown = JSON.parse(raw);
+    if (!Array.isArray(bytes) || bytes.length !== 64) {
+      throw new Error('SOLANA_PRIVATE_KEY as JSON must be an array of exactly 64 bytes');
+    }
+    return Uint8Array.from(bytes as number[]);
+  }
+  const hex = raw.replace(/^0x/, '');
+  if (!/^[0-9a-fA-F]{128}$/.test(hex)) {
+    throw new Error(
+      'SOLANA_PRIVATE_KEY must be a JSON array of 64 bytes or 128 hex chars (convert a base58 export first)',
+    );
+  }
+  return Uint8Array.from(Buffer.from(hex, 'hex'));
+}
+
+function solanaConnection(chain: ChainEntry): Connection {
+  return new Connection(
+    getRpcUrl(chain.kind === 'solana' ? chain.solana : SOLANA_DEF),
+    'confirmed',
+  );
+}
+
+// ----------------------------------------------------------------------------
+// CONFIG
+// ----------------------------------------------------------------------------
+
 type Config = {
   baseUrl: string;
-  srcChain: ChainDef;
+  srcChain: ChainEntry;
+  dstChain: ChainEntry;
   dstChainKey: string;
   privateKey: Hex;
-  walletAddress: Address;
+  /** The EVM EOA — signs on EVM spokes and is the subject of every EVM balance read. */
+  evmAddress: Address;
+  /**
+   * The address the API sees as `srcAddress` / `walletAddress`. A base58 pubkey for a Solana
+   * source, the EVM EOA otherwise. (`submit-tx` validates it as a 1–127 char string, not as an
+   * EVM address, precisely so a Solana pubkey is accepted.)
+   */
+  signerAddress: string;
   vaultSelector: { address?: Address; name?: string };
-  inputToken: Address;
-  outputToken: Address;
+  inputToken: string;
+  outputToken: string;
   slippageBps: bigint;
   withdrawBufferBps: bigint;
   deadlineOffsetSeconds: bigint;
@@ -179,72 +351,74 @@ type Config = {
   inputAmountHuman?: string;
 };
 
-/** Look a chain up by either registry key (`arbitrum`) or SpokeChainKey (`0xa4b1.arbitrum`). */
-function findChainDef(value: string): ChainDef | undefined {
-  return (
-    CHAIN_DEFS[value] ?? Object.values(CHAIN_DEFS).find((d) => d.chainKey.toLowerCase() === value)
-  );
-}
-
-function resolveChainDef(envVar: string, fallbackKey: string): ChainDef {
-  const key = (process.env[envVar] || fallbackKey).trim().toLowerCase();
-  const def = findChainDef(key);
-  if (!def) {
-    throw new Error(
-      `${envVar}='${key}' is not a known chain. Valid keys: ${Object.keys(CHAIN_DEFS).join(', ')}`,
-    );
-  }
-  return def;
-}
-
 /**
- * Resolve a destination chain to the **SpokeChainKey the API expects**, accepting either spelling.
- * Without this, `LEVERAGE_DST_CHAIN_KEY=arbitrum` would be forwarded verbatim and the backend would
- * reject it — the registry key (`arbitrum`) and the wire key (`0xa4b1.arbitrum`) are not the same.
+ * Validate a token address against the chain it belongs to. EVM spokes use `0x…`; Solana uses
+ * base58 — and spells native SOL as the system program id rather than a zero address, so that
+ * value is allowed through without a base58 round-trip.
  */
-function resolveSpokeChainKey(envVar: string, fallback: string): string {
-  const raw = process.env[envVar];
-  if (!raw) return fallback;
-  const def = findChainDef(raw.trim().toLowerCase());
-  if (!def) {
-    throw new Error(
-      `${envVar}='${raw}' is not a known chain. Valid keys: ${Object.keys(CHAIN_DEFS).join(', ')}`,
-    );
+function parseToken(name: string, value: string, chain: ChainEntry): string {
+  if (chain.kind === 'solana') {
+    if (value === SOLANA_NATIVE) return value;
+    try {
+      return new PublicKey(value).toBase58();
+    } catch {
+      throw new Error(`${name}='${value}' is not a valid Solana address`);
+    }
   }
-  return def.chainKey;
-}
-
-function getTokenEnv(name: string, fallback: Address): Address {
-  const value = process.env[name];
-  if (!value) return fallback;
   if (!isAddress(value)) throw new Error(`${name} is not a valid address`);
   return getAddress(value);
+}
+
+function getTokenEnv(name: string, fallback: string, chain: ChainEntry): string {
+  const value = process.env[name];
+  return value ? parseToken(name, value, chain) : fallback;
+}
+
+/** Vaults are always hub-side, so a vault selector is an EVM address whatever the source is. */
+function parseEvmAddress(name: string, value: string): Address {
+  if (!isAddress(value)) throw new Error(`${name} is not a valid EVM address`);
+  return getAddress(value);
+}
+
+/** The chain's own spelling of its native gas token. */
+function nativeTokenOf(chain: ChainEntry): string {
+  return chain.kind === 'solana' ? SOLANA_NATIVE : getAddress(NATIVE);
 }
 
 function loadConfig(): Config {
   const privateKey = normalizePrivateKey(getRequiredEnv('PRIVATE_KEY'));
   const account = privateKeyToAccount(privateKey);
-  const srcChain = resolveChainDef('LEVERAGE_SRC_CHAIN_KEY', 'sonic');
-  const dstChainKey = resolveSpokeChainKey('LEVERAGE_DST_CHAIN_KEY', srcChain.chainKey);
+  const srcChain = resolveChainEntry('LEVERAGE_SRC_CHAIN_KEY', 'sonic');
+  // Destination defaults to the source, i.e. a round trip. Resolving it as a full entry (not
+  // just a key) is what lets `outputToken` be validated against the right chain type.
+  const dstChain = process.env.LEVERAGE_DST_CHAIN_KEY
+    ? resolveChainEntry('LEVERAGE_DST_CHAIN_KEY', srcChain.chainKey)
+    : srcChain;
 
   // Default input: USDT on Sonic (what this wallet holds), native gas token elsewhere —
   // the same convention `chain-hop.ts` uses for spokes.
-  const defaultToken = srcChain.chainKey === 'sonic' ? getAddress(SONIC_USDT) : getAddress(NATIVE);
-  const inputToken = getTokenEnv('LEVERAGE_INPUT_TOKEN', defaultToken);
+  const defaultToken =
+    srcChain.chainKey === 'sonic' ? getAddress(SONIC_USDT) : nativeTokenOf(srcChain);
+  const inputToken = getTokenEnv('LEVERAGE_INPUT_TOKEN', defaultToken, srcChain);
 
   return {
     baseUrl: getLeverageBaseUrl(),
     srcChain,
-    dstChainKey,
+    dstChain,
+    dstChainKey: dstChain.chainKey,
     privateKey,
-    walletAddress: account.address,
+    evmAddress: account.address,
+    signerAddress:
+      srcChain.kind === 'solana' ? solanaKeypair(privateKey).publicKey.toBase58() : account.address,
     vaultSelector: {
-      address: process.env.LEVERAGE_VAULT ? getTokenEnv('LEVERAGE_VAULT', defaultToken) : undefined,
+      address: process.env.LEVERAGE_VAULT
+        ? parseEvmAddress('LEVERAGE_VAULT', process.env.LEVERAGE_VAULT)
+        : undefined,
       name: process.env.LEVERAGE_VAULT_NAME,
     },
     inputToken,
     // Withdraw back into the deposit token by default, i.e. a round trip.
-    outputToken: getTokenEnv('LEVERAGE_OUTPUT_TOKEN', inputToken),
+    outputToken: getTokenEnv('LEVERAGE_OUTPUT_TOKEN', inputToken, dstChain),
     slippageBps: getBigIntEnv('LEVERAGE_SLIPPAGE_BPS', 500n),
     withdrawBufferBps: getBigIntEnv('LEVERAGE_WITHDRAW_BUFFER_BPS', 50n),
     deadlineOffsetSeconds: getBigIntEnv('LEVERAGE_DEADLINE_OFFSET_SECONDS', 1800n),
@@ -298,8 +472,11 @@ function selectVault(vaults: Vault[], cfg: Config): Vault {
 // TOKEN HELPERS
 // ----------------------------------------------------------------------------
 
-function isNative(token: Address): boolean {
-  return token.toLowerCase() === NATIVE.toLowerCase();
+/** Is this the chain's native gas token, in whichever spelling that chain uses? */
+function isNativeOn(token: string, chain: ChainEntry): boolean {
+  return chain.kind === 'solana'
+    ? token === SOLANA_NATIVE
+    : token.toLowerCase() === NATIVE.toLowerCase();
 }
 
 function spokePublicClient(def: ChainDef) {
@@ -308,28 +485,53 @@ function spokePublicClient(def: ChainDef) {
 
 type TokenInfo = { symbol: string; decimals: number; balance: bigint };
 
-async function readTokenInfo(cfg: Config, token: Address): Promise<TokenInfo> {
-  const client = spokePublicClient(cfg.srcChain);
-  if (isNative(token)) {
+async function readTokenInfo(cfg: Config, token: string): Promise<TokenInfo> {
+  if (cfg.srcChain.kind === 'solana') return readSolanaTokenInfo(cfg, token);
+
+  const def = requireEvm(cfg.srcChain);
+  const client = spokePublicClient(def);
+  if (isNativeOn(token, cfg.srcChain)) {
     return {
       symbol: cfg.srcChain.nativeSymbol,
-      decimals: 18,
-      balance: await client.getBalance({ address: cfg.walletAddress }),
+      decimals: cfg.srcChain.nativeDecimals,
+      balance: await client.getBalance({ address: cfg.evmAddress }),
     };
   }
+  const erc20 = parseEvmAddress('inputToken', token);
   const [symbol, decimals, balance] = await Promise.all([
     client
-      .readContract({ address: token, abi: erc20Abi, functionName: 'symbol' })
+      .readContract({ address: erc20, abi: erc20Abi, functionName: 'symbol' })
       .catch(() => '???'),
-    client.readContract({ address: token, abi: erc20Abi, functionName: 'decimals' }),
+    client.readContract({ address: erc20, abi: erc20Abi, functionName: 'decimals' }),
     client.readContract({
-      address: token,
+      address: erc20,
       abi: erc20Abi,
       functionName: 'balanceOf',
-      args: [cfg.walletAddress],
+      args: [cfg.evmAddress],
     }),
   ]);
   return { symbol, decimals: Number(decimals), balance };
+}
+
+/**
+ * Solana-side balance read. Only native SOL is supported: an SPL input would need
+ * associated-token-account discovery, and native SOL is what leg 3 deposits anyway — it is also
+ * the cheapest input, since an SPL deposit additionally pays ATA rent.
+ */
+async function readSolanaTokenInfo(cfg: Config, token: string): Promise<TokenInfo> {
+  if (!isNativeOn(token, cfg.srcChain)) {
+    throw new Error(
+      `SPL token inputs are not implemented for a Solana source (got ${token}). Use native SOL (${SOLANA_NATIVE}).`,
+    );
+  }
+  const lamports = await solanaConnection(cfg.srcChain).getBalance(
+    new PublicKey(cfg.signerAddress),
+  );
+  return {
+    symbol: cfg.srcChain.nativeSymbol,
+    decimals: cfg.srcChain.nativeDecimals,
+    balance: BigInt(lamports),
+  };
 }
 
 /** Resolve the deposit amount in base units. `LEVERAGE_INPUT_AMOUNT` (raw) wins. */
@@ -341,7 +543,7 @@ function resolveInputAmount(cfg: Config, token: TokenInfo): bigint {
     return BigInt(cfg.explicitInputAmount);
   }
   if (cfg.inputAmountHuman) return parseUnits(cfg.inputAmountHuman, token.decimals);
-  if (isNative(cfg.inputToken)) {
+  if (isNativeOn(cfg.inputToken, cfg.srcChain)) {
     // "1" would mean 1 whole ETH/AVAX/BNB. Refuse to guess for a native deposit.
     throw new Error(
       'Set LEVERAGE_INPUT_AMOUNT_HUMAN (or LEVERAGE_INPUT_AMOUNT) explicitly for a native-token deposit',
@@ -359,17 +561,36 @@ function applySlippage(quoted: bigint, bps: bigint): bigint {
 // BROADCAST
 // ----------------------------------------------------------------------------
 
+/** How long to wait for a Solana signature to confirm, and how often to check. */
+const SOLANA_CONFIRM_TIMEOUT_MS = 90_000;
+const SOLANA_CONFIRM_POLL_MS = 1500;
+/** Build attempts for a Solana source — each retry fetches a tx with a fresh blockhash. */
+const SOLANA_BUILD_ATTEMPTS = 3;
+/** Lamports a native SOL deposit must leave behind to pay its own fee (~5000 is typical). */
+const SOLANA_FEE_HEADROOM_LAMPORTS = 1_000_000n;
+
 /**
- * Sign and broadcast one of the backend's unsigned txs on the source spoke, then wait for
+ * Raised only when a Solana blockhash has **provably** expired, which means the transaction can
+ * never land. That distinction is what makes a rebuild safe: retrying a merely-slow tx could
+ * double-spend, retrying a permanently-dead one cannot.
+ */
+class BlockhashExpiredError extends Error {}
+
+/** Sign and broadcast on the source spoke, dispatching on chain type. */
+async function signAndSend(cfg: Config, tx: UnsignedTx, label: string): Promise<string> {
+  return cfg.srcChain.kind === 'solana'
+    ? signAndSendSolana(cfg, tx, label)
+    : broadcastEvm(cfg, tx, label);
+}
+
+/**
+ * Sign and broadcast one of the backend's unsigned txs on an EVM source spoke, then wait for
  * the receipt. `ViemWalletProvider` is reused for its EIP-1559 fallback (some spoke RPCs
  * mis-estimate fees). A reverted tx throws here so we never submit it to the backend.
  */
-async function broadcast(cfg: Config, tx: UnsignedTx, label: string): Promise<Hex> {
-  const provider = new ViemWalletProvider(
-    cfg.privateKey,
-    cfg.srcChain.viemChain,
-    getRpcUrl(cfg.srcChain),
-  );
+async function broadcastEvm(cfg: Config, tx: UnsignedTx, label: string): Promise<Hex> {
+  const def = requireEvm(cfg.srcChain);
+  const provider = new ViemWalletProvider(cfg.privateKey, def.viemChain, getRpcUrl(def));
   console.log(`  ${label}: to=${tx.to} value=${tx.value ?? '0'} dataLen=${tx.data.length}`);
 
   const hash = (await provider.sendTransaction({
@@ -380,12 +601,139 @@ async function broadcast(cfg: Config, tx: UnsignedTx, label: string): Promise<He
   console.log(`  ${label} tx: ${hash}`);
   console.log(`  Waiting for confirmation...`);
 
-  const receipt = await spokePublicClient(cfg.srcChain).waitForTransactionReceipt({ hash });
+  const receipt = await spokePublicClient(def).waitForTransactionReceipt({ hash });
   if (receipt.status !== 'success') {
     throw new Error(`${label} tx ${hash} reverted on-chain (block ${receipt.blockNumber})`);
   }
   console.log(`  Confirmed in block ${receipt.blockNumber} | gas used: ${receipt.gasUsed}`);
   return hash;
+}
+
+/**
+ * Sign and broadcast a Solana source tx.
+ *
+ * There is nothing to assemble locally: `tx.data` is base64 of a fully serialized unsigned v0
+ * `VersionedTransaction` — one empty signature slot plus the message, blockhash already baked
+ * in — so we deserialize, sign with ed25519, and push the raw bytes. This is exactly why leg 3
+ * needs no SDK Solana wallet provider.
+ *
+ * The returned hash is a **base58 signature**, not `0x…`; that string is what `submit-tx` and
+ * `submit-tx/status` key on.
+ */
+async function signAndSendSolana(cfg: Config, tx: UnsignedTx, label: string): Promise<string> {
+  const connection = solanaConnection(cfg.srcChain);
+  const keypair = solanaKeypair(cfg.privateKey);
+  const raw = Buffer.from(tx.data, 'base64');
+  const vtx = VersionedTransaction.deserialize(raw);
+  const blockhash = vtx.message.recentBlockhash;
+  console.log(
+    `  ${label}: ${raw.length}B serialized, v${vtx.version}, ` +
+      `${vtx.message.compiledInstructions.length} instructions, ` +
+      `${vtx.message.staticAccountKeys.length} account keys, blockhash ${blockhash}`,
+  );
+
+  vtx.sign([keypair]);
+
+  let signature: string;
+  try {
+    signature = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: false });
+  } catch (err) {
+    if (isBlockhashExpiryError(err)) {
+      throw new BlockhashExpiredError(`${label}: blockhash ${blockhash} expired before send`);
+    }
+    throw err;
+  }
+  console.log(`  ${label} tx: ${signature}`);
+  console.log(`  Waiting for confirmation...`);
+  await confirmSolanaSignature(connection, signature, blockhash, label);
+  return signature;
+}
+
+/** The RPC's way of saying the embedded blockhash is already too old to accept. */
+function isBlockhashExpiryError(err: unknown): boolean {
+  const message = String((err as Error)?.message ?? err);
+  return /blockhash not found|block height exceeded|BlockhashNotFound/i.test(message);
+}
+
+/**
+ * Poll until the signature confirms.
+ *
+ * If it has not landed *and* its blockhash is no longer valid, the transaction is permanently
+ * dead and that is surfaced as `BlockhashExpiredError` so the caller can rebuild. Checking
+ * blockhash validity rather than just timing out is the safety property here — a bare timeout
+ * cannot distinguish "dead" from "slow", and rebuilding on "slow" risks a second deposit.
+ */
+async function confirmSolanaSignature(
+  connection: Connection,
+  signature: string,
+  blockhash: string,
+  label: string,
+): Promise<void> {
+  const deadline = Date.now() + SOLANA_CONFIRM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const status = (await connection.getSignatureStatuses([signature])).value[0];
+
+    if (status?.err) {
+      throw new Error(`${label} tx ${signature} failed on-chain: ${JSON.stringify(status.err)}`);
+    }
+    if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
+      console.log(`  Confirmed (${status.confirmationStatus}) in slot ${status.slot}`);
+      return;
+    }
+    if (!status) {
+      const stillValid = (await connection.isBlockhashValid(blockhash, { commitment: 'confirmed' }))
+        .value;
+      if (!stillValid) {
+        throw new BlockhashExpiredError(
+          `${label}: blockhash ${blockhash} expired with no signature status — the tx can never land`,
+        );
+      }
+    }
+    await sleep(SOLANA_CONFIRM_POLL_MS);
+  }
+  throw new Error(
+    `${label} tx ${signature} did not confirm within ${SOLANA_CONFIRM_TIMEOUT_MS}ms. ` +
+      `Check it on an explorer before re-running — it may still land.`,
+  );
+}
+
+/**
+ * Build the intent, then sign and send it — refetching the tx if the blockhash expires.
+ *
+ * A Solana transaction embeds a blockhash valid for only ~60–90s, so unlike every EVM leg so
+ * far the payload cannot sit around between build and broadcast, and a stale one must never be
+ * resent. On a provable expiry we call the builder again for fresh bytes. A rebuild produces a
+ * *different* intent, so this returns whichever pair actually confirmed and only that one is
+ * submitted. EVM sources have no expiry and so never retry.
+ */
+async function buildSignSend(
+  cfg: Config,
+  build: () => Promise<CreateIntentResponse>,
+  label: string,
+): Promise<{ created: CreateIntentResponse; txHash: string }> {
+  const attempts = cfg.srcChain.kind === 'solana' ? SOLANA_BUILD_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const created = await build();
+    if (attempt === 1) {
+      console.log(`  intentId   : ${created.intent.intentId}`);
+      console.log(`\n  Full create-intent response:`);
+      console.dir(created, { depth: null });
+    } else {
+      console.log(
+        `  Rebuilt (attempt ${attempt}/${attempts}) intentId: ${created.intent.intentId}`,
+      );
+    }
+
+    try {
+      return { created, txHash: await signAndSend(cfg, created.tx, label) };
+    } catch (err) {
+      if (!(err instanceof BlockhashExpiredError) || attempt === attempts) throw err;
+      console.log(`  ${err.message}`);
+      console.log(`  Re-calling the builder for a tx with a fresh blockhash...`);
+    }
+  }
+  throw new Error(`${label}: exhausted ${attempts} build attempts`);
 }
 
 // ----------------------------------------------------------------------------
@@ -414,7 +762,7 @@ const EXPECTED_STATUS_OPERATION: Record<Operation, string> = {
 async function submitLeverageTx(
   cfg: Config,
   args: {
-    txHash: Hex;
+    txHash: string;
     intent: BackendIntent;
     relayData: CreateIntentResponse['relayData'];
     operation: Operation;
@@ -424,7 +772,7 @@ async function submitLeverageTx(
   const base = {
     txHash: args.txHash,
     srcChainKey: cfg.srcChain.chainKey,
-    walletAddress: cfg.walletAddress,
+    walletAddress: cfg.signerAddress,
     intent: args.intent,
     operation: args.operation,
   };
@@ -456,16 +804,30 @@ type LegEvidence = {
   vaultName: string;
   vaultAddress: Address;
   srcChainKey: string;
+  srcChainName: string;
+  /** `solana` here is what makes a leg the #1029 leg-3 evidence rather than a repeat of 1/2. */
+  srcChainKind: ChainEntry['kind'];
   dstChainKey?: string;
   hubWallet: Address;
-  walletAddress: Address;
-  inputToken: Address;
+  /** Base58 pubkey for a Solana source, EVM EOA otherwise. */
+  signerAddress: string;
+  inputToken: string;
   inputAmount: string;
   quotedAmount: string;
   minOutputAmount: string;
   deadline: string;
-  approveTxHash?: Hex;
-  txHash: Hex;
+  approveTxHash?: string;
+  /** Base58 signature for a Solana source, `0x…` hash otherwise. */
+  txHash: string;
+  /**
+   * Structural fields lifted off the create-intent response. `submit-tx/status` does NOT echo
+   * the intent, so without capturing them here the non-EVM divergence (a `solana` source row
+   * against a hub-side `intent.srcChain`) cannot be shown from the saved evidence alone.
+   */
+  intentSrcChain?: string;
+  intentSrcAddress?: string;
+  intentCreator?: string;
+  relayDataAddress?: string;
   statusUrl: string;
   submitResponse: SubmitResponse;
   relayDataForm: 'payload' | 'object';
@@ -477,6 +839,20 @@ type LegEvidence = {
   sharesAfter?: string;
   elapsedMs: number;
 };
+
+/**
+ * Lift the structural intent fields off the create-intent response. `submit-tx/status` does not
+ * echo the intent, so these have to be recorded at build time or they are lost to the evidence.
+ */
+function intentFields(created: CreateIntentResponse) {
+  const asString = (v: unknown) => (v === undefined || v === null ? undefined : String(v));
+  return {
+    intentSrcChain: asString(created.intent.srcChain),
+    intentSrcAddress: asString(created.intent.srcAddress),
+    intentCreator: asString(created.intent.creator),
+    relayDataAddress: created.relayData.address,
+  };
+}
 
 /** Assert the two things #1029 is actually testing, and say which one failed. */
 function assessProof(status: StatusResponse, operation: Operation) {
@@ -520,6 +896,17 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
   if (token.balance < inputAmount) {
     throw new Error(`Insufficient ${token.symbol}: have ${token.balance}, need ${inputAmount}`);
   }
+  // A native deposit spends the same balance the tx fee comes out of, so depositing right up to
+  // the balance leaves nothing to pay with. Solana fees are ~5000 lamports; 0.001 SOL is ample.
+  if (cfg.srcChain.kind === 'solana' && isNativeOn(cfg.inputToken, cfg.srcChain)) {
+    const headroom = SOLANA_FEE_HEADROOM_LAMPORTS;
+    if (token.balance - inputAmount < headroom) {
+      throw new Error(
+        `Deposit would leave ${token.balance - inputAmount} lamports for fees; keep at least ${headroom}. ` +
+          `Lower LEVERAGE_INPUT_AMOUNT_HUMAN or top up ${cfg.signerAddress}.`,
+      );
+    }
+  }
 
   // Step 2: quote, then take our own slippage off it.
   console.log(`\n[2/6] Quote deposit`);
@@ -538,7 +925,7 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
   const intentBody = {
     vault: vault.vault,
     srcChainKey: cfg.srcChain.chainKey,
-    srcAddress: cfg.walletAddress,
+    srcAddress: cfg.signerAddress,
     inputToken: cfg.inputToken,
     inputAmount: inputAmount.toString(),
     minOutputAmount: minOutputAmount.toString(),
@@ -548,8 +935,8 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
   // Step 3: allowance/check + approve — the backend's own endpoints, so this run exercises
   // them too rather than approving locally via `approveIfNeeded`.
   console.log(`\n[3/6] Allowance check`);
-  let approveTxHash: Hex | undefined;
-  if (isNative(cfg.inputToken)) {
+  let approveTxHash: string | undefined;
+  if (isNativeOn(cfg.inputToken, cfg.srcChain)) {
     console.log(`  Native input token — no ERC20 approval needed`);
   } else {
     const allowance = await postJson<{ valid: boolean }>(
@@ -561,24 +948,23 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
       console.log(`  Allowance sufficient — skipping approve`);
     } else {
       const { tx } = await postJson<{ tx: UnsignedTx }>(`${cfg.baseUrl}/approve`, intentBody);
-      approveTxHash = await broadcast(cfg, tx, 'approve');
+      approveTxHash = await signAndSend(cfg, tx, 'approve');
       await sleep(2000);
     }
   }
 
-  // Step 4: the backend builds the intent tx; we only sign it.
+  // Step 4: the backend builds the intent tx; we only sign it. For a Solana source the build
+  // and the broadcast must stay back to back — the tx carries a blockhash that expires in
+  // ~60–90s — so `buildSignSend` owns both and refetches if it goes stale.
   console.log(`\n[4/6] Build + broadcast deposit intent`);
-  const created = await postJson<CreateIntentResponse>(
-    `${cfg.baseUrl}/intents/deposit`,
-    intentBody,
+  console.log(`  deadline   : ${deadline} (${new Date(Number(deadline) * 1000).toISOString()})`);
+  const { created, txHash } = await buildSignSend(
+    cfg,
+    () => postJson<CreateIntentResponse>(`${cfg.baseUrl}/intents/deposit`, intentBody),
+    'deposit',
   );
   const hubWallet = getAddress(created.intent.creator);
-  console.log(`  intentId   : ${created.intent.intentId}`);
   console.log(`  hub wallet : ${hubWallet}  (intent.creator — the shares' owner, NOT the EOA)`);
-  console.log(`  deadline   : ${deadline} (${new Date(Number(deadline) * 1000).toISOString()})`);
-  console.log(`\n  Full create-intent response:`);
-  console.dir(created, { depth: null });
-  const txHash = await broadcast(cfg, created.tx, 'deposit');
 
   // Step 5 + 6: submit, then poll to a terminal state.
   console.log(`\n[5/6] Submit to backend`);
@@ -610,8 +996,10 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
     vaultName: vault.name,
     vaultAddress: vault.vault,
     srcChainKey: cfg.srcChain.chainKey,
+    srcChainName: cfg.srcChain.name,
+    srcChainKind: cfg.srcChain.kind,
     hubWallet,
-    walletAddress: cfg.walletAddress,
+    signerAddress: cfg.signerAddress,
     inputToken: cfg.inputToken,
     inputAmount: inputAmount.toString(),
     quotedAmount: quote.quotedAmount,
@@ -619,6 +1007,7 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
     deadline: deadline.toString(),
     approveTxHash,
     txHash,
+    ...intentFields(created),
     statusUrl: `${cfg.baseUrl}/submit-tx/status?txHash=${txHash}&srcChainKey=${cfg.srcChain.chainKey}`,
     submitResponse: submitted.response,
     relayDataForm: submitted.relayDataForm,
@@ -639,15 +1028,29 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
  * that address, not the EOA, so we need it before we can size a withdraw.
  */
 async function resolveHubWallet(cfg: Config, vault: Vault): Promise<Address> {
-  const probe = await postJson<CreateIntentResponse>(`${cfg.baseUrl}/intents/deposit`, {
-    vault: vault.vault,
-    srcChainKey: cfg.srcChain.chainKey,
-    srcAddress: cfg.walletAddress,
-    inputToken: cfg.inputToken,
-    inputAmount: '1',
-    minOutputAmount: '0',
-  });
-  return getAddress(probe.intent.creator);
+  const probe = (inputAmount: string) =>
+    postJson<CreateIntentResponse>(`${cfg.baseUrl}/intents/deposit`, {
+      vault: vault.vault,
+      srcChainKey: cfg.srcChain.chainKey,
+      srcAddress: cfg.signerAddress,
+      inputToken: cfg.inputToken,
+      inputAmount,
+      minOutputAmount: '0',
+    });
+
+  try {
+    return getAddress((await probe('1')).intent.creator);
+  } catch (err) {
+    // A 1-unit probe can be rejected as dust — the builder still has to price a route for it.
+    // Retry once with something routable; the amount is irrelevant since nothing is broadcast.
+    console.log(`  1-unit probe rejected, retrying with a routable amount...`);
+    const fallback = parseUnits('0.01', cfg.srcChain.nativeDecimals).toString();
+    try {
+      return getAddress((await probe(fallback)).intent.creator);
+    } catch {
+      throw err;
+    }
+  }
 }
 
 async function runWithdraw(
@@ -717,24 +1120,25 @@ async function runWithdraw(
   // same call). Approving here would just burn gas on a no-op.
   console.log(`\n[3/5] Build + broadcast withdraw intent (no approve step by design)`);
   const deadline = unixNow() + cfg.deadlineOffsetSeconds;
-  const created = await postJson<CreateIntentResponse>(`${cfg.baseUrl}/intents/withdraw`, {
-    vault: vault.vault,
-    srcChainKey: cfg.srcChain.chainKey,
-    srcAddress: cfg.walletAddress,
-    dstChainKey: cfg.dstChainKey,
-    outputToken: cfg.outputToken,
-    inputAmount: shares.toString(),
-    minOutputAmount: minOutputAmount.toString(),
-    deadline: deadline.toString(),
-    // NB: no `partnerFee` — leverage withdrawals have no such field (deposits do).
-    // See icon-project/sodax-sdks#325.
-  });
-  console.log(`  intentId : ${created.intent.intentId}`);
-  console.log(`\n  Full create-intent response:`);
-  console.dir(created, { depth: null });
-  // Note the asymmetry under test: we sign on `srcChainKey` (a spoke) while the shares — and
-  // `intent.srcChain` — are hub-side.
-  const txHash = await broadcast(cfg, created.tx, 'withdraw');
+  // Note the asymmetry under test: we sign on `srcChainKey` (a spoke, possibly non-EVM) while
+  // the shares — and `intent.srcChain` — are hub-side.
+  const { created, txHash } = await buildSignSend(
+    cfg,
+    () =>
+      postJson<CreateIntentResponse>(`${cfg.baseUrl}/intents/withdraw`, {
+        vault: vault.vault,
+        srcChainKey: cfg.srcChain.chainKey,
+        srcAddress: cfg.signerAddress,
+        dstChainKey: cfg.dstChainKey,
+        outputToken: cfg.outputToken,
+        inputAmount: shares.toString(),
+        minOutputAmount: minOutputAmount.toString(),
+        deadline: deadline.toString(),
+        // NB: no `partnerFee` — leverage withdrawals have no such field (deposits do).
+        // See icon-project/sodax-sdks#325.
+      }),
+    'withdraw',
+  );
 
   console.log(`\n[4/5] Submit to backend`);
   const submitted = await submitLeverageTx(cfg, {
@@ -764,15 +1168,18 @@ async function runWithdraw(
     vaultName: vault.name,
     vaultAddress: vault.vault,
     srcChainKey: cfg.srcChain.chainKey,
+    srcChainName: cfg.srcChain.name,
+    srcChainKind: cfg.srcChain.kind,
     dstChainKey: cfg.dstChainKey,
     hubWallet,
-    walletAddress: cfg.walletAddress,
+    signerAddress: cfg.signerAddress,
     inputToken: vault.vault,
     inputAmount: shares.toString(),
     quotedAmount: quote.quotedAmount,
     minOutputAmount: minOutputAmount.toString(),
     deadline: deadline.toString(),
     txHash,
+    ...intentFields(created),
     statusUrl: `${cfg.baseUrl}/submit-tx/status?txHash=${txHash}&srcChainKey=${cfg.srcChain.chainKey}`,
     submitResponse: submitted.response,
     relayDataForm: submitted.relayDataForm,
@@ -789,8 +1196,11 @@ async function runWithdraw(
 
 async function runDiscovery(cfg: Config): Promise<void> {
   console.log(`\nLeverage Yield — read-only discovery (no funds spent)`);
-  console.log(`Wallet : ${cfg.walletAddress}`);
+  console.log(`Signer : ${cfg.signerAddress} (${cfg.srcChain.kind})`);
   console.log(`Source : ${cfg.srcChain.name} (${cfg.srcChain.chainKey})`);
+  if (cfg.srcChain.kind === 'solana') {
+    console.log(`EVM EOA: ${cfg.evmAddress} (same PRIVATE_KEY, unrelated address)`);
+  }
 
   console.log(`\n[1/5] GET /vaults`);
   const vaults = await fetchVaults(cfg);
@@ -832,27 +1242,46 @@ async function runDiscovery(cfg: Config): Promise<void> {
     ),
   ]);
   console.log(`  hub wallet (intent.creator) : ${hubWallet}`);
-  console.log(`  EOA                         : ${cfg.walletAddress}`);
+  console.log(`  signer (srcAddress)         : ${cfg.signerAddress}`);
   console.log(`  share-balance               : ${shareBalance.balance}`);
   console.log(`  max-withdraw (RAW)          : ${maxWithdraw.maxWithdraw}`);
 
   console.log(`\n[4/5] POST /quote/withdraw`);
-  // Quote the round trip: whatever the deposit above would mint, priced back out.
-  const withdrawProbe =
-    BigInt(shareBalance.balance) > 0n
-      ? BigInt(shareBalance.balance)
-      : BigInt(depositQuote.quotedAmount);
-  const withdrawQuote = await postJson<QuoteResponse>(`${cfg.baseUrl}/quote/withdraw`, {
-    vault: vault.vault,
-    srcChainKey: cfg.srcChain.chainKey,
-    tokenDst: cfg.outputToken,
-    tokenDstChainKey: cfg.dstChainKey,
-    amount: withdrawProbe.toString(),
-    quoteType: 'exact_input',
-  });
-  console.log(
-    `  ${withdrawProbe} ${vault.name} shares -> ${withdrawQuote.quotedAmount} (${cfg.outputToken} on ${cfg.dstChainKey})`,
-  );
+  const quoteWithdraw = (amount: bigint) =>
+    postJson<QuoteResponse>(`${cfg.baseUrl}/quote/withdraw`, {
+      vault: vault.vault,
+      srcChainKey: cfg.srcChain.chainKey,
+      tokenDst: cfg.outputToken,
+      tokenDstChainKey: cfg.dstChainKey,
+      amount: amount.toString(),
+      quoteType: 'exact_input',
+    });
+
+  // Price the real position if there is one, else what the deposit above would mint. A residual
+  // dust position is common (`max-withdraw` never lets a vault be fully exited) and too small to
+  // route — the backend reports that as a flat "No path was found", so fall back to the
+  // deposit-sized amount to show the route does exist. Read-only: never fatal.
+  const positionShares = BigInt(shareBalance.balance);
+  const mintedShares = BigInt(depositQuote.quotedAmount);
+  const probes: { amount: bigint; label: string }[] =
+    positionShares > 0n
+      ? [
+          { amount: positionShares, label: 'current position' },
+          { amount: mintedShares, label: 'deposit-sized (position too small to route)' },
+        ]
+      : [{ amount: mintedShares, label: 'deposit-sized' }];
+
+  for (const probe of probes) {
+    try {
+      const quote = await quoteWithdraw(probe.amount);
+      console.log(
+        `  ${probe.amount} ${vault.name} shares [${probe.label}] -> ${quote.quotedAmount} (${cfg.outputToken} on ${cfg.dstChainKey})`,
+      );
+      break;
+    } catch (err) {
+      console.log(`  ${probe.amount} [${probe.label}] failed: ${(err as Error).message}`);
+    }
+  }
 
   console.log(`\n[5/5] Negative test — malformed vault must be 400 (not a 502)`);
   const negative = await postRaw(`${cfg.baseUrl}/quote/deposit`, {
@@ -872,16 +1301,54 @@ async function runDiscovery(cfg: Config): Promise<void> {
 // PROOF REPORT
 // ----------------------------------------------------------------------------
 
+/**
+ * The fields that make a non-EVM source distinctive, pulled out for the #1029 write-up: the
+ * source spoke stays `solana` while the intent itself is hub-side (`srcChain` 146) and owned by
+ * the derived hub wallet, and `packetData` carries the cross-chain delivery proof. Read
+ * defensively — anything the response does not carry is reported as absent, not guessed.
+ */
+function divergenceLines(e: LegEvidence): string[] {
+  const data = (e.finalStatus.data ?? {}) as Record<string, unknown>;
+  // The status row carries no `intent`, so prefer what was captured off the create-intent
+  // response and only fall back to the row if a future API version starts echoing it.
+  const intent = (data.intent ?? {}) as Record<string, unknown>;
+  // `packetData` sits under `result` in the swaps-api response shape, but has been seen at the
+  // top level too — check both rather than silently reporting it absent.
+  const result = (data.result ?? {}) as Record<string, unknown>;
+  const packet = (data.packetData ?? result.packetData ?? {}) as Record<string, unknown>;
+  const show = (v: unknown) => (v === undefined || v === null ? '(absent)' : String(v));
+
+  return [
+    ``,
+    `Non-EVM source divergence (what this leg uniquely proves):`,
+    ``,
+    `| field | value |`,
+    `|---|---|`,
+    `| \`row.srcChainKey\` | \`${show(data.srcChainKey)}\` |`,
+    `| \`intent.srcChain\` | \`${show(e.intentSrcChain ?? intent.srcChain)}\` (hub id, even though the tx was signed on Solana) |`,
+    `| \`intent.srcAddress\` | \`${show(e.intentSrcAddress ?? intent.srcAddress)}\` |`,
+    `| \`intent.creator\` | \`${show(e.intentCreator ?? intent.creator)}\` |`,
+    `| \`relayData.address\` | \`${show(e.relayDataAddress ?? e.hubWallet)}\` |`,
+    `| \`packetData.src_chain_id\` | \`${show(packet.src_chain_id)}\` |`,
+    `| \`packetData.dst_chain_id\` | \`${show(packet.dst_chain_id)}\` |`,
+    `| \`packetData.status\` | \`${show(packet.status)}\` |`,
+    ``,
+    `\`relayData\` was accepted as: **${e.relayDataForm}**. \`relayData.payload\` is only read by`,
+    `the relay for non-EVM sources (EVM relays \`{chain_id, tx_hash}\` and ignores it), so this run`,
+    `is the first to actually exercise it.`,
+  ];
+}
+
 function proofBlock(e: LegEvidence): string {
   const lines = [
-    `### ${e.leg === 'deposit' ? 'Leg 1 — EVM-spoke deposit' : 'Leg 2 — EVM-spoke withdraw'} (${e.vaultName})`,
+    `### ${e.leg === 'deposit' ? 'Deposit' : 'Withdraw'} from ${e.srcChainName} (${e.vaultName})`,
     ``,
     `- vault         : ${e.vaultAddress}`,
-    `- srcChainKey   : ${e.srcChainKey}`,
+    `- srcChainKey   : ${e.srcChainKey} (${e.srcChainKind})`,
     ...(e.dstChainKey ? [`- dstChainKey   : ${e.dstChainKey}`] : []),
     `- source tx     : ${e.txHash}`,
     ...(e.approveTxHash ? [`- approve tx    : ${e.approveTxHash}`] : []),
-    `- EOA signer    : ${e.walletAddress}`,
+    `- signer        : ${e.signerAddress}`,
     `- hub wallet    : ${e.hubWallet} (shares owner)`,
     `- inputAmount   : ${e.inputAmount}`,
     `- quotedAmount  : ${e.quotedAmount}`,
@@ -894,6 +1361,7 @@ function proofBlock(e: LegEvidence): string {
     '```json',
     JSON.stringify(e.finalStatus, null, 2),
     '```',
+    ...(e.srcChainKind === 'solana' ? divergenceLines(e) : []),
     ``,
     `Proof: operation=\`${e.statusOperation}\` (expected \`${e.expectedOperation}\`), status=\`${e.statusValue}\` -> ${e.proofOk ? 'PASS' : 'FAIL'}`,
   ];
@@ -939,7 +1407,12 @@ const USAGE = `Usage: tsx leverage-yield.ts <mode>
                   and the malformed-vault 400 negative test. Spends nothing.
   --deposit       Leg 1: spoke token -> lsoda* shares. SPENDS REAL FUNDS.
   --withdraw      Leg 2: lsoda* shares -> spoke token. SPENDS REAL FUNDS.
-  --round-trip    Leg 1 then Leg 2 back to back. SPENDS REAL FUNDS.`;
+  --round-trip    Leg 1 then Leg 2 back to back. SPENDS REAL FUNDS.
+
+The source spoke comes from LEVERAGE_SRC_CHAIN_KEY (default sonic). Set it to \`solana\` for
+the non-EVM split-tx path — #1029's leg 3 — which signs ed25519 instead of secp256k1 and pays
+out via the hub wallet. Remember hub wallets are PER SPOKE: shares deposited from one spoke
+cannot be withdrawn from another, so a Solana withdraw needs a Solana deposit first.`;
 
 async function main() {
   const mode = process.argv[2] ?? '--vaults';
@@ -961,8 +1434,9 @@ async function main() {
   const startMs = Date.now();
   const vault = selectVault(await fetchVaults(cfg), cfg);
   console.log(`\nLeverage Yield money-path test — ${mode.replace('--', '')}`);
-  console.log(`Wallet : ${cfg.walletAddress}`);
+  console.log(`Signer : ${cfg.signerAddress} (${cfg.srcChain.kind})`);
   console.log(`Source : ${cfg.srcChain.name} (${cfg.srcChain.chainKey})`);
+  console.log(`Dest   : ${cfg.dstChain.name} (${cfg.dstChainKey})`);
   console.log(`Vault  : ${vault.name} (${vault.vault})`);
 
   const evidence: LegEvidence[] = [];

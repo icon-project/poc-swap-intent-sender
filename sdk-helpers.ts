@@ -222,6 +222,42 @@ export const CHAIN_DEFS: Record<string, ChainDef> = {
 } as const;
 
 // ----------------------------------------------------------------------------
+// SOLANA (NON-EVM) SPOKE
+// ----------------------------------------------------------------------------
+//
+// `CHAIN_DEFS` above is typed to viem's `Chain`, so Solana cannot go in it. It gets its own
+// def, sharing the field names that matter (`chainKey`, RPC resolution) so `getRpcUrl` and
+// the leverage script's chain registry can treat EVM and Solana sources uniformly.
+//
+// Only the leverage script uses this — `chain-hop.ts` and the swap flow remain EVM-only.
+
+export type SolanaChainDef = {
+  chainKey: SpokeChainKey;
+  name: string;
+  nativeSymbol: string;
+  nativeDecimals: number;
+  defaultRpcUrl: string;
+  rpcEnvVar: string;
+};
+
+export const SOLANA_DEF: SolanaChainDef = {
+  chainKey: 'solana',
+  name: 'Solana',
+  nativeSymbol: 'SOL',
+  nativeDecimals: 9,
+  // Last-resort public endpoint. It is aggressively rate-limited — point SOLANA_RPC_URL at a
+  // dedicated provider for anything that broadcasts.
+  defaultRpcUrl: 'https://api.mainnet-beta.solana.com',
+  rpcEnvVar: 'SOLANA_RPC_URL',
+};
+
+/**
+ * Native SOL as the SODAX spoke config addresses it: the system program id. Note this is a
+ * different convention from EVM spokes, which use the zero address (`NATIVE` below).
+ */
+export const SOLANA_NATIVE = '11111111111111111111111111111111';
+
+// ----------------------------------------------------------------------------
 // HOP DEFINITIONS
 // ----------------------------------------------------------------------------
 
@@ -431,7 +467,10 @@ export const RETURN_HOPS: HopDef[] = [
 // provider internally from `params.srcChainKey`, so the old `createSpokeProvider`
 // factory (and the `SonicSpokeProvider`/`spokeChainConfig` plumbing) is gone.
 
-export function getRpcUrl(chainDef: ChainDef): string {
+/** Anything carrying an RPC override env var plus a default — `ChainDef` or `SolanaChainDef`. */
+export type RpcConfigurable = { defaultRpcUrl: string; rpcEnvVar: string };
+
+export function getRpcUrl(chainDef: RpcConfigurable): string {
   return process.env[chainDef.rpcEnvVar] || chainDef.defaultRpcUrl;
 }
 

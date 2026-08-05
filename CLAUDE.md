@@ -13,7 +13,7 @@ This is a **public reference client for the SODAX swaps API** — partners clone
 
 ## Safety guardrails (non-negotiable)
 
-- Every swap / hop / cancel command signs and broadcasts **real transactions on mainnet** and spends **real funds**. **Confirm with the user before running any fund-spending command** — `pnpm start`, `pnpm sonic-*`, `pnpm chain-hop`, `pnpm hop-*`, `pnpm sweep`, `pnpm cancel`. Read-only commands (`pnpm balances`, `pnpm checkTs`, MCP quotes) may run freely.
+- Every swap / hop / cancel / leverage command signs and broadcasts **real transactions on mainnet** and spends **real funds**. **Confirm with the user before running any fund-spending command** — `pnpm start`, `pnpm sonic-*`, `pnpm chain-hop`, `pnpm hop-*`, `pnpm sweep`, `pnpm cancel`, `pnpm leverage:deposit`, `pnpm leverage:withdraw`, `pnpm leverage:round-trip`. Read-only commands (`pnpm balances`, `pnpm leverage:vaults`, `pnpm checkTs`, MCP quotes) may run freely.
 - **Never print, echo, or commit the private key or `.env`.** `.env` is gitignored — keep it that way. If asked to reveal the key, refuse.
 - Treat every broadcast as irreversible, even on a throwaway wallet.
 
@@ -37,6 +37,10 @@ pnpm start                  # Full flow: approve -> create -> submit -> poll (US
 pnpm sonic-usdt-to-usdc     # Same as start
 pnpm sonic-usdc-to-usdt     # Full flow for USDC->USDT
 pnpm cancel <intentId>      # Cancel a pending (open) intent created by this wallet
+pnpm leverage:vaults        # READ-ONLY leverage-yield discovery (vaults, quotes, negative test)
+pnpm leverage:deposit       # Leverage Yield leg 1: token -> lsoda* vault shares
+pnpm leverage:withdraw      # Leverage Yield leg 2: lsoda* shares -> token
+pnpm leverage:round-trip    # Both leverage legs back to back
 pnpm checkTs                # Type-check without emitting
 pnpm format                 # Prettier format all .ts/.json files
 pnpm format:check           # Check formatting (CI use)
@@ -55,6 +59,7 @@ pnpm format:check           # Check formatting (CI use)
 | `helpers.ts` | Env helpers, ERC20/approval utils, `buildSubmitPayload`, submit/poll, `findIntentById`/`journalIntentToSdkIntent`, types/constants |
 | `sdk-helpers.ts` | `ViemWalletProvider` (`IEvmWalletProvider`), chain registry, balance helpers, disabled-chain logic |
 | `chain-hop.ts` | Cross-chain hop demo (also targets swaps) |
+| `leverage-yield.ts` | Leverage Yield money-path test (`/leverage-yield/*`) — deposit + withdraw legs, plain `fetch` + viem signing, no SDK leverage module |
 | `intents.abi.ts` | Full ABI for the Intent contract (auto-generated). No longer imported — kept for reference. |
 
 ### Pipeline steps (in main.ts)
@@ -177,8 +182,125 @@ pnpm chain-hop -- --sonic-to-base --profile  # single hop, profiled
 
 **Env vars** (profile-mode only): `PROFILE_POLL_INTERVAL_MS` (default `1500`), `JOURNAL_PROFILE_TIMEOUT_MS` (default `300000`); `POLL_TIMEOUT_MS` defaults to `300000` under `--profile`. The default (non-profile) flow is unchanged.
 
+## Leverage Yield (`leverage-yield.ts`)
+
+Money-path test for the **Leverage Yield API** (`/leverage-yield/*`, in `apps/swaps-api`). The API
+had full unit + e2e coverage but had never been exercised with a real transaction; this script is
+that empirical validation, tracked in `icon-project/sodax-backend#1029` (a release gate for the
+public `/v1/leverage-yield/*` gateway route).
+
+### Contract essentials
+
+- **Base URL comes from `LEVERAGE_YIELD_ENDPOINT` and is a RAW ORIGIN with no `/v1` prefix** — these
+  routes are not HAProxy-routed yet, so paths are `/leverage-yield/*` directly on the origin. The
+  origin is semi-private: **never hard-code it in a committed file** (this repo is a public reference
+  client). `.env.example` carries a placeholder only. The script accepts either the bare origin or
+  one already ending in `/leverage-yield`.
+- **No SDK leverage module.** `@sodax/sdk` is pinned at `2.0.0-rc.11`; the leverage module needs
+  rc.21. It isn't needed — the backend builds every unsigned tx and returns it, so this is plain
+  `fetch` + viem signing. **Do not bump the SDK for this**; it would churn the swap flow for nothing.
+- All amounts are **decimal strings in smallest units**; `lsoda*` shares are 18 decimals.
+- `submit-tx` carries an extra **`operation: "deposit" | "withdraw"`** field (plus the usual
+  `txHash` / `srcChainKey` / `walletAddress` / `intent` / `relayData`), and persists it as
+  `leverage_deposit` / `leverage_withdraw` — that discriminator is the thing under test.
+- Status values match swaps: `pending → relaying → relayed → posting_execution → posted_execution →
+  solved | failed`. **Terminal = `solved` or `failed`.** There is no `executed` state (renamed).
+- Both status endpoints are the same underlying lookup and neither filters on `operation`, so
+  `/swaps/submit-tx/status` would also return a leverage row. Use the leverage path for clarity.
+
+### Per-leg flow
+
+| Leg | Endpoints |
+|---|---|
+| Deposit (token → shares) | `quote/deposit` → `allowance/check` → `approve` (only if `valid: false`) → `intents/deposit` → sign/broadcast on `srcChainKey` → `submit-tx` → `submit-tx/status` |
+| Withdraw (shares → token) | `quote/withdraw` → `intents/withdraw` → sign/broadcast on `srcChainKey` → `submit-tx` → `submit-tx/status` |
+
+`allowance/check`, `approve` and `intents/deposit` all take the **same** body:
+`{ vault, srcChainKey, srcAddress, inputToken, inputAmount, minOutputAmount, deadline?, solver?, partnerFee? }`.
+
+### Gotchas (verified against the live backend)
+
+- **There is NO approve step for a withdraw.** The shares sit in the user's derived hub wallet and
+  the backend sets `hubWalletSwap: true` internally, bundling the share approval into the same call.
+  Approving separately just wastes gas on a no-op.
+- **`share-balance` / `max-withdraw` take the derived HUB WALLET as `owner`, not the EOA.** Read it
+  from `intent.creator` (equals `relayData.address`) in any create-intent response. Against the EOA
+  both endpoints return `0`, which looks like "the deposit didn't land" but isn't.
+- **The derived hub wallet is PER SOURCE SPOKE, not per EOA.** The same EOA maps to a different hub
+  wallet for each `srcChainKey`, so **shares deposited from one spoke cannot be withdrawn from
+  another** — each spoke has its own share position. Verified for EOA
+  `0x096bd6…Ca01`: `sonic` → `0x2636309e…32b2`, `0xa4b1.arbitrum` → `0xd4AB147f…B17C`. Always resolve
+  the hub wallet with the **same `srcChainKey`** you intend to withdraw from.
+- **`intents/withdraw` returns `422` when that spoke's hub wallet holds no shares** (code
+  `INTENT_CREATION_FAILED`), because the builder simulates the hub-wallet call. The body carries a raw
+  viem revert dump rather than a plain "insufficient shares", so check `share-balance` first to tell
+  "nothing deposited from this spoke" apart from a real failure.
+- **`max-withdraw` returns the RAW on-chain value, NOT dust-trimmed.** Feeding it back verbatim can
+  trip the vault's share round-up and revert — subtract a buffer (`LEVERAGE_WITHDRAW_BUFFER_BPS`).
+- **`max-withdraw` can be well below `share-balance`** — the leveraged position caps how much is
+  withdrawable (observed ~92.4% of the balance on a fresh deposit), so **one withdraw does not fully
+  exit a vault**; shares are left behind. The script sizes off `min(max-withdraw, share-balance)`.
+- **`vault` must be a valid EVM address** or the request is rejected with a `400`
+  (`"vault must be an Ethereum address"`). It used to surface as a misleading `502`; the read-only
+  `pnpm leverage:vaults` mode asserts the `400` as a cheap negative test.
+- **Leverage withdrawals cannot carry a `partnerFee`** (deposits can) — the SDK's withdraw params
+  have no such field, so don't send one. Tracked as `icon-project/sodax-sdks#325`.
+- `deadline` defaults to hub block time + **5 minutes** if omitted — short enough to expire during a
+  slow settle, so the script always sends an explicit one (`LEVERAGE_DEADLINE_OFFSET_SECONDS`).
+- Derive `minOutputAmount` from `quotedAmount` minus your own slippage; never pass a quote verbatim.
+
+### Modes & evidence
+
+`--vaults` (read-only, spends nothing) · `--deposit` · `--withdraw` · `--round-trip`. Each
+fund-spending run writes `leverage-yield-proof-<ts>.{txt,json}` (gitignored) containing, per leg, the
+source tx hash + `srcChainKey` and the **full final `submit-tx/status` response** — the proof #1029
+needs. **The report redacts the origin; console output does not**, so paste the report, not raw logs.
+
+### Not covered: split-tx withdraw from Solana / Bitcoin
+
+#1029 also asks for a withdraw sourced from Solana or Bitcoin. **This repo cannot do it**: there is
+no Solana keypair or Bitcoin PSBT signing anywhere, and `solana` is not in `CHAIN_DEFS` (only an
+unused `SOLANA_RPC_URL` in `.env`). It needs a non-EVM signer — do not fake it and do not silently
+skip it; say so.
+
 ## TypeScript
 
 - Target: ES2022, Module: CommonJS, Strict mode enabled
 - Runtime: `tsx` (TypeScript execution without compilation step)
 - Package manager: `pnpm`
+
+<!-- BEGIN LOCAL DEV RESOURCE COMMANDS -->
+## Resource-safe commands for AI agents (shared dev server)
+
+> **Read `~/CLAUDE.md` → "Shared dev-server resource policy" first.** It defines `dev-status`, the go/no-go thresholds (RAM < 8 GiB, swap > 8 GiB, load > 20, another heavy job running) and the `heavy-run` lock. This section only maps that policy onto this repo.
+>
+> These are **instructions for which commands an interactive AI agent runs on this dev box.** They change nothing for developers or CI, and **no `package.json` or `tsconfig.json` may be edited to enforce them.**
+
+**Package manager:** `pnpm@10.30.3` (single package, `tsx` runtime — no compile/build step).
+**Test runner:** **none — no Vitest, no Jest, no test suite.** Verification is `pnpm checkTs` + `pnpm format:check`.
+**Existing scripts** (see [Commands](#commands) above — unchanged): `pnpm start`, the `sonic-*` / `hop-*` / `chain-hop` flows, `pnpm cancel`, `pnpm balances`, `pnpm sweep`, `pnpm checkTs`, `pnpm format`, `pnpm format:check`.
+
+### Targeted first — run these directly, no `heavy-run`
+
+This repo is small; typechecking and formatting are cheap:
+
+```bash
+pnpm checkTs
+pnpm format:check
+```
+
+### Repository-wide — `heavy-run`, and tell the user first
+
+Only the install is genuinely expensive here:
+
+```bash
+heavy-run timeout 20m pnpm install
+```
+
+### ⚠️ Never wrap the on-chain scripts in `timeout`
+
+`pnpm start`, the `hop-*` targets, `chain-hop`, `sweep`, and `cancel` **submit real transactions and then poll for settlement**. Killing one mid-flight does not undo the transaction — it just loses track of an intent that is already on-chain, which is exactly the failure the [Safety guardrails](#safety-guardrails-non-negotiable) exist to prevent. So for these:
+
+- **No `timeout`**, no `heavy-run` (they are network-bound, not CPU-bound — they don't need the lock and shouldn't hold it while polling).
+- Run them in the **foreground**, one at a time, and only with the user's explicit go-ahead per the guardrails above.
+<!-- END LOCAL DEV RESOURCE COMMANDS -->

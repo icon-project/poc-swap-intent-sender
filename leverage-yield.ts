@@ -854,6 +854,33 @@ function intentFields(created: CreateIntentResponse) {
   };
 }
 
+/**
+ * Read the hub wallet's share position for the evidence record.
+ *
+ * Deliberately **soft**. By the time this runs the leg has already reached a terminal status, so
+ * a transient failure on this auxiliary read must not throw — doing so would propagate out of the
+ * leg, leave `evidence` empty, and make `main`'s `finally` skip the proof report entirely,
+ * discarding the only artifact from a run that spent real funds.
+ */
+async function readSharesSoft(
+  cfg: Config,
+  vault: Vault,
+  hubWallet: Address,
+  label: string,
+): Promise<string | undefined> {
+  try {
+    const { balance } = await getJson<{ balance: string }>(
+      `${cfg.baseUrl}/share-balance?vault=${vault.vault}&owner=${hubWallet}`,
+    );
+    console.log(`    ${label} ${hubWallet}: ${balance}`);
+    return balance;
+  } catch (err) {
+    console.log(`    ${label} ${hubWallet}: unavailable — ${(err as Error).message}`);
+    console.log(`    (evidence is unaffected; the leg already reached a terminal status)`);
+    return undefined;
+  }
+}
+
 /** Assert the two things #1029 is actually testing, and say which one failed. */
 function assessProof(status: StatusResponse, operation: Operation) {
   const data = status.data ?? {};
@@ -986,10 +1013,7 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
   const proof = assessProof(finalStatus, 'deposit');
 
   // Confirm the shares actually landed — owned by the derived hub wallet, not the EOA.
-  const shares = await getJson<{ balance: string }>(
-    `${cfg.baseUrl}/share-balance?vault=${vault.vault}&owner=${hubWallet}`,
-  );
-  console.log(`    shares held by ${hubWallet}: ${shares.balance}`);
+  const sharesAfter = await readSharesSoft(cfg, vault, hubWallet, 'shares held by');
 
   return {
     leg: 'deposit',
@@ -1012,7 +1036,7 @@ async function runDeposit(cfg: Config, vault: Vault): Promise<LegEvidence> {
     submitResponse: submitted.response,
     relayDataForm: submitted.relayDataForm,
     finalStatus,
-    sharesAfter: shares.balance,
+    sharesAfter,
     ...proof,
     elapsedMs: Date.now() - startMs,
   };
@@ -1042,12 +1066,18 @@ async function resolveHubWallet(cfg: Config, vault: Vault): Promise<Address> {
     return getAddress((await probe('1')).intent.creator);
   } catch (err) {
     // A 1-unit probe can be rejected as dust — the builder still has to price a route for it.
-    // Retry once with something routable; the amount is irrelevant since nothing is broadcast.
-    console.log(`  1-unit probe rejected, retrying with a routable amount...`);
-    const fallback = parseUnits('0.01', cfg.srcChain.nativeDecimals).toString();
+    // Retry once with something routable. Size it in the INPUT TOKEN's decimals, not the chain's
+    // native ones: 0.01 USDT (6dp) is 1e4, while 0.01 of an 18dp token is 1e16, so using native
+    // decimals on the default Sonic USDT source would ask for ~10 billion USDT and be rejected
+    // again. Nothing is broadcast here, so the amount only has to be routable.
     try {
+      const { decimals, symbol } = await readTokenInfo(cfg, cfg.inputToken);
+      const fallback = parseUnits('0.01', decimals).toString();
+      console.log(`  1-unit probe rejected; retrying with 0.01 ${symbol} (${fallback})`);
       return getAddress((await probe(fallback)).intent.creator);
     } catch {
+      // Surface the original dust rejection — it is the informative one, and the fallback may
+      // have failed for an unrelated reason (e.g. an unsupported SPL balance read).
       throw err;
     }
   }
@@ -1080,18 +1110,31 @@ async function runWithdraw(
     `  max-withdraw  : ${maxWithdraw.maxWithdraw} (RAW on-chain value, not dust-trimmed)`,
   );
 
+  // The real ceiling is the lower of the two: the position caps what exists, `max-withdraw` caps
+  // what the leveraged position will release.
+  const ceiling = BigInt(maxWithdraw.maxWithdraw);
+  const balance = BigInt(shareBalance.balance);
+  const usable = ceiling < balance ? ceiling : balance;
+
   let shares: bigint;
   if (cfg.explicitWithdrawShares) {
     if (!/^\d+$/.test(cfg.explicitWithdrawShares)) {
       throw new Error('LEVERAGE_WITHDRAW_SHARES must be an integer string (base units)');
     }
     shares = BigInt(cfg.explicitWithdrawShares);
+    // Even the raw ceiling can revert on-chain via the vault's share round-up, so anything above
+    // it is a guaranteed wasted broadcast. Refuse here rather than pay gas to discover it.
+    if (shares > usable) {
+      throw new Error(
+        `LEVERAGE_WITHDRAW_SHARES=${shares} exceeds the withdrawable ceiling ${usable} ` +
+          `(the lower of max-withdraw ${ceiling} and share-balance ${balance}). ` +
+          `Lower it, or unset it to size automatically with the ${cfg.withdrawBufferBps}bps dust buffer.`,
+      );
+    }
+    console.log(`  withdrawing   : ${shares} (explicit, within the ${usable} ceiling)`);
   } else {
     // `max-withdraw` is the raw on-chain figure; feeding it back verbatim can trip the
     // vault's share round-up and revert. Take a buffer off it.
-    const ceiling = BigInt(maxWithdraw.maxWithdraw);
-    const balance = BigInt(shareBalance.balance);
-    const usable = ceiling < balance ? ceiling : balance;
     shares = (usable * (10_000n - cfg.withdrawBufferBps)) / 10_000n;
     console.log(`  withdrawing   : ${shares} (usable − ${cfg.withdrawBufferBps}bps dust buffer)`);
   }
@@ -1158,10 +1201,7 @@ async function runWithdraw(
   )) as StatusResponse;
   const proof = assessProof(finalStatus, 'withdraw');
 
-  const sharesAfter = await getJson<{ balance: string }>(
-    `${cfg.baseUrl}/share-balance?vault=${vault.vault}&owner=${hubWallet}`,
-  );
-  console.log(`    shares remaining for ${hubWallet}: ${sharesAfter.balance}`);
+  const sharesAfter = await readSharesSoft(cfg, vault, hubWallet, 'shares remaining for');
 
   return {
     leg: 'withdraw',
@@ -1184,7 +1224,7 @@ async function runWithdraw(
     submitResponse: submitted.response,
     relayDataForm: submitted.relayDataForm,
     finalStatus,
-    sharesAfter: sharesAfter.balance,
+    sharesAfter,
     ...proof,
     elapsedMs: Date.now() - startMs,
   };
@@ -1292,9 +1332,16 @@ async function runDiscovery(cfg: Config): Promise<void> {
     quoteType: 'exact_input',
   });
   console.log(`  HTTP ${negative.status}: ${negative.body}`);
-  console.log(
-    `  ${negative.status === 400 ? 'PASS — rejected with 400' : `FAIL — expected 400, got ${negative.status}`}`,
-  );
+  // This is an assertion, not a report: `--vaults` is documented as checking the 400 behaviour, so
+  // a regression has to make the command exit non-zero or nothing watching it can tell the
+  // difference. Throwing is safe here — it is the last step, so no earlier output is lost.
+  if (negative.status !== 400) {
+    throw new Error(
+      `Negative test REGRESSED: a malformed vault returned ${negative.status}, expected 400. ` +
+        `This previously surfaced as a misleading 502. Body: ${negative.body}`,
+    );
+  }
+  console.log(`  PASS — rejected with 400`);
 }
 
 // ----------------------------------------------------------------------------

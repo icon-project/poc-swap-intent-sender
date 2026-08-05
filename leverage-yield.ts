@@ -374,6 +374,38 @@ function getTokenEnv(name: string, fallback: string, chain: ChainEntry): string 
   return value ? parseToken(name, value, chain) : fallback;
 }
 
+/**
+ * The withdraw payout token, validated against the **destination** chain.
+ *
+ * It defaults to the deposit token — a round trip — but that default only means anything when the
+ * destination speaks the same address format as the source. Native SOL is the system program id
+ * while EVM natives are the zero address, so once a Solana source became possible a cross-type
+ * default (say src `solana`, dst `sonic`) would quietly send a Solana program id as `tokenDst` and
+ * fail deep inside the quote. Fail fast with a config error instead.
+ *
+ * Note the narrower pre-existing gap this does not close: between two *EVM* chains the default is
+ * format-valid but still probably wrong (Sonic USDT's address means nothing on Base). Address
+ * validation cannot catch that, so set `LEVERAGE_OUTPUT_TOKEN` for any cross-chain withdraw.
+ */
+function resolveOutputToken(
+  inputToken: string,
+  srcChain: ChainEntry,
+  dstChain: ChainEntry,
+): string {
+  const explicit = process.env.LEVERAGE_OUTPUT_TOKEN;
+  if (explicit) return parseToken('LEVERAGE_OUTPUT_TOKEN', explicit, dstChain);
+
+  try {
+    return parseToken('LEVERAGE_OUTPUT_TOKEN', inputToken, dstChain);
+  } catch {
+    throw new Error(
+      `LEVERAGE_OUTPUT_TOKEN must be set explicitly for a ${srcChain.name} -> ${dstChain.name} withdraw: ` +
+        `the default (the deposit token ${inputToken}) is not a valid ${dstChain.name} address. ` +
+        `${dstChain.kind === 'solana' ? `Native SOL is ${SOLANA_NATIVE}` : `The native gas token is ${NATIVE}`}.`,
+    );
+  }
+}
+
 /** Vaults are always hub-side, so a vault selector is an EVM address whatever the source is. */
 function parseEvmAddress(name: string, value: string): Address {
   if (!isAddress(value)) throw new Error(`${name} is not a valid EVM address`);
@@ -417,8 +449,7 @@ function loadConfig(): Config {
       name: process.env.LEVERAGE_VAULT_NAME,
     },
     inputToken,
-    // Withdraw back into the deposit token by default, i.e. a round trip.
-    outputToken: getTokenEnv('LEVERAGE_OUTPUT_TOKEN', inputToken, dstChain),
+    outputToken: resolveOutputToken(inputToken, srcChain, dstChain),
     slippageBps: getBigIntEnv('LEVERAGE_SLIPPAGE_BPS', 500n),
     withdrawBufferBps: getBigIntEnv('LEVERAGE_WITHDRAW_BUFFER_BPS', 50n),
     deadlineOffsetSeconds: getBigIntEnv('LEVERAGE_DEADLINE_OFFSET_SECONDS', 1800n),

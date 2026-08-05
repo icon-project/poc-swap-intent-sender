@@ -1342,16 +1342,28 @@ async function runDiscovery(cfg: Config): Promise<void> {
         ]
       : [{ amount: mintedShares, label: 'deposit-sized' }];
 
+  let quoted = false;
   for (const probe of probes) {
     try {
       const quote = await quoteWithdraw(probe.amount);
       console.log(
         `  ${probe.amount} ${vault.name} shares [${probe.label}] -> ${quote.quotedAmount} (${cfg.outputToken} on ${cfg.dstChainKey})`,
       );
+      quoted = true;
       break;
     } catch (err) {
       console.log(`  ${probe.amount} [${probe.label}] failed: ${(err as Error).message}`);
     }
+  }
+  // Tolerating a dust-sized probe failure is the point of the fallback, but tolerating *every*
+  // failure would mean this step silently stops checking the thing it advertises. If no amount
+  // quotes, the route itself is unavailable — that is a real finding, so fail the preflight.
+  if (!quoted) {
+    throw new Error(
+      `quote/withdraw failed for every probe (${probes.map((p) => p.amount).join(', ')}). ` +
+        `A dust-sized position failing on its own is expected, but nothing quoting means the ` +
+        `withdraw route ${vault.name} -> ${cfg.outputToken} on ${cfg.dstChainKey} is unavailable.`,
+    );
   }
 
   console.log(`\n[5/5] Negative test — malformed vault must be 400 (not a 502)`);
